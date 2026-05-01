@@ -1,21 +1,14 @@
 // ============================================================
 // YAPSON-BOT7 — Automatisation des retraits (Withdrawals)
 // ============================================================
-// Cycle automatique :
-//   1. Lire les retraits en attente sur my-managment.com
-//   2. Créer les décaissements sur connect.yapson.net
-//   3. Confirmer les retraits sur my-managment.com
-// ============================================================
 
 const express = require('express');
 const fetch   = require('node-fetch');
 
 const app  = express();
 const PORT = process.env.PORT || 8080;
-
-// ── Config depuis variables d'environnement Railway ──────────
-let MGMT_COOKIES    = process.env.MGMT_COOKIES    || '';
-let YAPSON_TOKEN    = process.env.YAPSON_TOKEN     || '';
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // ── Mapping réseau → UUID ─────────────────────────────────────
 const NET_UUIDS = {
@@ -26,312 +19,307 @@ const NET_UUIDS = {
   'Wave'     : '97847ae3-6c50-4116-a6da-a69695afbaaa',
 };
 
-// YAPSON_NETWORK : "Orangeint" ou "ORANGE CI" (défaut: Orangeint)
-const YAPSON_NETWORK_NAME = process.env.YAPSON_NETWORK || 'Orangeint';
-const YAPSON_NETWORK = NET_UUIDS[YAPSON_NETWORK_NAME] || NET_UUIDS['Orangeint'];
-const POLL_INTERVAL   = parseInt(process.env.POLL_INTERVAL || '900') * 1000;
-const MAX_SOLDE       = parseInt(process.env.MAX_SOLDE || '0');
-
-const state = {
-  running: false, lastCycle: null, cycles: 0,
-  totalOk: 0, totalErr: 0, totalFCFA: 0,
-  log: [], status: 'idle', solde: 0,
+// ── Config mutable ─────────────────────────────────────────────
+let cfg = {
+  mgmtCookies  : process.env.MGMT_COOKIES   || '',
+  yapsonToken  : process.env.YAPSON_TOKEN   || '',
+  network      : process.env.YAPSON_NETWORK || 'Orangeint',
+  pollInterval : parseInt(process.env.POLL_INTERVAL || '900'),
+  maxSolde     : parseInt(process.env.MAX_SOLDE || '0'),
 };
 
+// ── Stats & logs ───────────────────────────────────────────────
+const stats = { confirmed: 0, missing: 0, fixed: 0, polls: 0, rejected: 0 };
+const logs  = [];
+let pollTimer = null;
+let isRunning = false;
+let botActive = false;
+
 function addLog(type, msg) {
-  const ts = new Date().toISOString().replace('T',' ').substring(0,19);
-  state.log.unshift({ ts, type, msg });
-  if (state.log.length > 200) state.log.pop();
+  const ts = new Date().toISOString().replace('T', ' ').substring(0, 19);
+  logs.unshift({ ts, type, msg });
+  if (logs.length > 300) logs.pop();
   console.log(`[${type.toUpperCase()}] ${ts} — ${msg}`);
 }
 
-function mgmtHeaders() {
+function mgmtH() {
   return {
-    'Content-Type': 'application/json',
-    'X-Requested-With': 'XMLHttpRequest',
-    'Cookie': MGMT_COOKIES,
-    'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
-    'Referer': 'https://my-managment.com/fr/admin/report/pendingrequestwithdrawal',
+    'Content-Type'     : 'application/json',
+    'X-Requested-With' : 'XMLHttpRequest',
+    'Cookie'           : cfg.mgmtCookies,
+    'User-Agent'       : 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+    'Referer'          : 'https://my-managment.com/fr/admin/report/pendingrequestwithdrawal',
   };
 }
-
-function yapsonHeaders() {
-  return {
-    'Content-Type': 'application/json',
-    'Authorization': `Bearer ${YAPSON_TOKEN}`,
-  };
+function yapH() {
+  return { 'Content-Type':'application/json', 'Authorization': `Bearer ${cfg.yapsonToken}` };
 }
 
-async function getSolde() {
-  try {
-    await fetch('https://connect.yapson.net/api/aggregator/dashboard/', { headers: yapsonHeaders() });
-    return MAX_SOLDE > 0 ? MAX_SOLDE : 99999999;
-  } catch (e) {
-    return MAX_SOLDE > 0 ? MAX_SOLDE : 99999999;
-  }
-}
-
-async function getWithdrawals(solde) {
+async function getWithdrawals() {
   const res = await fetch('https://my-managment.com/admin/report/pendingrequestwithdrawal', {
-    method: 'POST',
-    headers: mgmtHeaders(),
-    body: JSON.stringify({ page: 1, limit: 500 }),
+    method: 'POST', headers: mgmtH(), body: JSON.stringify({ page: 1, limit: 500 }),
   });
-  if (!res.ok) throw new Error(`HTTP ${res.status} — vérifier les cookies`);
+  if (!res.ok) throw new Error(`HTTP ${res.status} — cookies expirés ?`);
   const data = await res.json();
   const rows = data.data || [];
-  const selected = [];
-  let cumul = 0;
+  const out  = []; let cumul = 0;
+  const solde = cfg.maxSolde > 0 ? cfg.maxSolde : 99999999;
   for (const row of rows) {
-    const montant = row.summa_sort || parseInt((row.summa || '').replace(/[^0-9]/g, '')) || 0;
-    let phone = row.dopparam && row.dopparam[0] ? row.dopparam[0].description || '' : '';
-    const pm = String(phone).match(/0[0-9]{9}/);
-    if (!pm || montant <= 0 || cumul + montant > solde) continue;
-    selected.push({ phone: pm[0], montant, confirmData: row.confirm && row.confirm[0] ? row.confirm[0].data : null });
+    const montant = row.summa_sort || parseInt((row.summa||'').replace(/[^0-9]/g,''))||0;
+    const phone   = row.dopparam?.[0]?.description || '';
+    const pm      = String(phone).match(/0[0-9]{9}/);
+    if (!pm || montant<=0 || cumul+montant>solde) continue;
+    out.push({ phone: pm[0], montant, confirmData: row.confirm?.[0]?.data || null });
     cumul += montant;
   }
-  addLog('info', `${rows.length} retraits lus, ${selected.length} sélectionnés (${cumul.toLocaleString()} FCFA)`);
-  return selected;
+  addLog('info', `${rows.length} retraits lus — ${out.length} sélectionnés (${cumul.toLocaleString()} FCFA)`);
+  return out;
 }
 
-async function createPayout(item) {
-  const res = await fetch('https://connect.yapson.net/api/aggregator/payout/', {
-    method: 'POST',
-    headers: yapsonHeaders(),
-    body: JSON.stringify({ amount: item.montant, recipient_phone: item.phone, network: YAPSON_NETWORK }),
+async function payout(item) {
+  const uuid = NET_UUIDS[cfg.network] || NET_UUIDS['Orangeint'];
+  const res  = await fetch('https://connect.yapson.net/api/aggregator/payout/', {
+    method: 'POST', headers: yapH(),
+    body: JSON.stringify({ amount: item.montant, recipient_phone: item.phone, network: uuid }),
   });
   const body = await res.json();
-  if (res.status === 200 || res.status === 201) return { ok: true };
-  return { ok: false, err: JSON.stringify(body).substring(0, 100) };
+  if (res.status===200||res.status===201) return { ok: true };
+  return { ok: false, err: JSON.stringify(body).substring(0,100) };
 }
 
-async function confirmWithdrawal(item) {
+async function confirmW(item) {
   if (!item.confirmData) return { ok: false, err: 'Pas de confirmData' };
   const fd = new URLSearchParams();
-  fd.append('code', item.confirmData.code || 'epay');
-  fd.append('id', String(item.confirmData.id));
-  fd.append('comment', '');
-  fd.append('commentId', 'null');
+  fd.append('code'        , item.confirmData.code||'epay');
+  fd.append('id'          , String(item.confirmData.id));
+  fd.append('comment'     , '');
+  fd.append('commentId'   , 'null');
   fd.append('otherComment', '');
-  fd.append('is_out', 'true');
-  fd.append('subagent_id', String(item.confirmData.subagent_id));
-  fd.append('ref_id', String(item.confirmData.ref_id || 1));
-  fd.append('bank_id', 'null');
-  fd.append('report_id', '');
+  fd.append('is_out'      , 'true');
+  fd.append('subagent_id' , String(item.confirmData.subagent_id));
+  fd.append('ref_id'      , String(item.confirmData.ref_id||1));
+  fd.append('bank_id'     , 'null');
+  fd.append('report_id'   , '');
   const res = await fetch('https://my-managment.com/admin/banktransfer/approvemoney', {
-    method: 'POST',
-    headers: { ...mgmtHeaders(), 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: fd.toString(),
+    method:'POST', headers:{...mgmtH(),'Content-Type':'application/x-www-form-urlencoded'}, body:fd.toString(),
   });
-  const body = await res.json();
+  const body = await res.json().catch(()=>({}));
   if (body.success) return { ok: true };
   const res2 = await fetch('https://my-managment.com/admin/banktransfer/approvemoney', {
-    method: 'POST', headers: mgmtHeaders(), body: JSON.stringify(item.confirmData),
+    method:'POST', headers:mgmtH(), body:JSON.stringify(item.confirmData),
   });
-  const body2 = await res2.json();
-  return { ok: body2.success === true, err: body2.message || JSON.stringify(body2).substring(0,80) };
+  const body2 = await res2.json().catch(()=>({}));
+  return { ok: body2.success===true, err: body2.message||'Erreur' };
 }
+
+function sleep(ms) { return new Promise(r=>setTimeout(r,ms)); }
 
 async function runCycle() {
-  if (state.running) return;
-  state.running = true; state.status = 'running';
-  state.cycles++; state.lastCycle = new Date().toISOString();
-  addLog('info', `=== Cycle ${state.cycles} démarré ===`);
+  if (isRunning) return;
+  isRunning = true; stats.polls++;
+  addLog('info', `━━ Poll #${stats.polls} ━━`);
   try {
-    if (!MGMT_COOKIES) throw new Error('MGMT_COOKIES non configuré');
-    if (!YAPSON_TOKEN)  throw new Error('YAPSON_TOKEN non configuré');
-    const solde = await getSolde();
-    state.solde = solde;
-    addLog('info', `Solde: ${solde.toLocaleString()} FCFA`);
-    const withdrawals = await getWithdrawals(solde);
-    if (withdrawals.length === 0) {
-      addLog('info', `Aucun retrait — prochain cycle dans ${POLL_INTERVAL/60000}min`);
-      return;
+    if (!cfg.mgmtCookies) throw new Error('MGMT_COOKIES manquant');
+    if (!cfg.yapsonToken)  throw new Error('YAPSON_TOKEN manquant');
+    const items = await getWithdrawals();
+    if (!items.length) {
+      addLog('info', `Poll F2: 0 confirmé(s), 0 rejeté(s)`);
+      isRunning = false; return;
     }
-    addLog('info', `Envoi de ${withdrawals.length} décaissement(s)...`);
-    const paid = [];
-    for (const item of withdrawals) {
-      const result = await createPayout(item);
-      if (result.ok) {
-        addLog('ok', `✔ ${item.phone} → ${item.montant.toLocaleString()} FCFA`);
-        paid.push(item); state.totalOk++; state.totalFCFA += item.montant;
-      } else {
-        addLog('err', `✘ ${item.phone} — ${result.err}`);
-        state.totalErr++;
-      }
-      await new Promise(r => setTimeout(r, 800));
+    let ok=0, ko=0; const paid=[];
+    for (const item of items) {
+      const r = await payout(item);
+      if (r.ok) { paid.push(item); ok++; addLog('ok',`✔ ${item.phone} → ${item.montant.toLocaleString()} FCFA`); }
+      else       { ko++; stats.missing++; addLog('err',`✘ ${item.phone} — ${r.err}`); }
+      await sleep(800);
     }
-    if (paid.length > 0) {
-      addLog('info', `Confirmation de ${paid.length} retrait(s)...`);
-      await new Promise(r => setTimeout(r, 1500));
+    if (paid.length) {
+      await sleep(1500);
       for (const item of paid) {
-        const result = await confirmWithdrawal(item);
-        if (result.ok) addLog('ok', `✔ Confirmé: ${item.phone}`);
-        else addLog('warn', `⚠ Manuel requis: ${item.phone} — ${result.err || ''}`);
-        await new Promise(r => setTimeout(r, 700));
+        const r = await confirmW(item);
+        if (r.ok) { stats.confirmed++; addLog('ok',`✔ Confirmé: ${item.phone}`); }
+        else       { stats.missing++;  addLog('warn',`⚠ Manuel: ${item.phone}`); }
+        await sleep(700);
       }
     }
-    addLog('ok', `=== Cycle ${state.cycles} terminé: ${paid.length} op(s) ===`);
-  } catch (e) {
-    addLog('err', `Erreur cycle: ${e.message}`); state.status = 'error';
-  } finally {
-    state.running = false;
-    if (state.status === 'running') state.status = 'idle';
-  }
+    addLog('info', `Poll F2: ${ok} confirmé(s), ${ko} rejeté(s)`);
+    items.forEach(i=>addLog('dot',`${i.phone} — ${(new Date()).toLocaleTimeString('fr-FR')}`));
+  } catch(e) {
+    addLog('err',`Erreur: ${e.message}`); stats.rejected++;
+  } finally { isRunning=false; }
 }
 
-let pollTimer = null;
 function startPolling() {
   if (pollTimer) return;
-  addLog('info', `Polling démarré — ${POLL_INTERVAL/60000}min`);
-  runCycle(); pollTimer = setInterval(runCycle, POLL_INTERVAL);
+  botActive=true;
+  addLog('ok',`Bot démarré — ${cfg.pollInterval}s — ${cfg.network}`);
+  runCycle();
+  pollTimer=setInterval(runCycle, cfg.pollInterval*1000);
 }
 function stopPolling() {
-  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-  addLog('info', 'Polling arrêté');
+  if (pollTimer){clearInterval(pollTimer);pollTimer=null;}
+  botActive=false; addLog('warn','Bot arrêté');
 }
 
-app.use(express.json());
-
-app.get('/', (req, res) => {
-  const intervalMin = (POLL_INTERVAL/60000).toFixed(0);
-  const logHtml = state.log.slice(0,50).map(e => {
-    const cls = e.type==='ok'?'ok':e.type==='err'?'err':e.type==='warn'?'warn':'info';
-    return `<div class="le ${cls}"><span class="lt">${e.ts.substring(11,19)}</span><span>${e.msg}</span></div>`;
+app.get('/', (req,res)=>{
+  const logHtml = logs.slice(0,100).map(e=>{
+    const cls=e.type==='ok'?'ok':e.type==='err'?'er':e.type==='warn'?'wa':e.type==='dot'?'dt':'in';
+    const ic =e.type==='ok'?'✔':e.type==='err'?'✘':e.type==='warn'?'⚠':e.type==='dot'?'◉':'▸';
+    return `<div class="le ${cls}"><span class="lt">${e.ts.substring(0,19)}</span><span>${ic} ${e.msg}</span></div>`;
   }).join('');
-  res.send(`<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8">
+  const netOpts = Object.keys(NET_UUIDS).map(n=>`<option value="${n}" ${n===cfg.network?'selected':''}>${n}</option>`).join('');
+  res.send(`<!DOCTYPE html>
+<html lang="fr"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>YapsonBot7</title><meta http-equiv="refresh" content="30">
-<style>*{box-sizing:border-box;margin:0;padding:0}
-body{background:#080810;font-family:Courier New,monospace;color:#e2e8f0;padding:20px;font-size:13px}
-.app{max-width:720px;margin:0 auto}
-.hdr{display:flex;align-items:center;gap:12px;padding:16px 0 20px}
-.logo{width:42px;height:42px;border-radius:10px;background:#4ade80;display:flex;align-items:center;justify-content:center;font-weight:900;font-size:18px;color:#000}
-h1{font-size:20px;font-weight:700}.sub{font-size:11px;color:#64748b;margin-top:2px}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}
-.card{background:#10101a;border-radius:10px;border:1px solid rgba(255,255,255,.08);padding:14px 16px}
-.card h3{font-size:8px;letter-spacing:2px;color:#64748b;text-transform:uppercase;margin-bottom:10px}
-.stat{font-size:26px;font-weight:700}.lbl{font-size:9px;color:#64748b;margin-top:3px}
-.badge{display:inline-block;border-radius:5px;padding:3px 10px;font-size:11px;font-weight:700}
-.badge-ok{background:rgba(74,222,128,.2);color:#4ade80}
-.badge-err{background:rgba(248,113,113,.2);color:#f87171}
-.badge-idle{background:rgba(100,116,139,.2);color:#64748b}
-.badge-run{background:rgba(96,165,250,.2);color:#60a5fa}
-.cfgrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px;font-size:11px}
-.dot{width:8px;height:8px;border-radius:50%;background:#f87171;flex-shrink:0}
-.dot.ok{background:#4ade80}
-.log{background:#0e0e12;border-radius:8px;padding:10px;max-height:320px;overflow-y:auto;font-size:9px;line-height:1.9;border:1px solid rgba(255,255,255,.06)}
-.le{display:flex;gap:10px}.lt{color:#64748b;min-width:50px;flex-shrink:0}
-.ok .le>span:last-child{color:#4ade80}.err .le>span:last-child{color:#f87171}
-.warn .le>span:last-child{color:#fb923c}.info .le>span:last-child{color:#60a5fa}
-.actions{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
-.btn{padding:9px 20px;border-radius:7px;font-family:Courier New,monospace;font-size:11px;font-weight:700;cursor:pointer;border:none;text-decoration:none}
-.btn-g{background:rgba(74,222,128,.2);color:#4ade80;border:1px solid rgba(74,222,128,.4)}
-.btn-r{background:rgba(248,113,113,.2);color:#f87171;border:1px solid rgba(248,113,113,.4)}
-.btn-b{background:rgba(96,165,250,.15);color:#60a5fa;border:1px solid rgba(96,165,250,.3)}
-</style></head><body><div class="app">
-<div class="hdr"><div class="logo">7</div><div><h1>YapsonBot7</h1>
-<div class="sub">Automatisation des retraits • Réseau: ${YAPSON_NETWORK_NAME}</div></div></div>
-<div class="grid">
-<div class="card"><h3>Statut</h3>
-<span class="badge ${state.status==='idle'?'badge-idle':state.status==='running'?'badge-run':'badge-err'}">
-${state.status==='idle'?'⏸ En attente':state.status==='running'?'▶ En cours':'✘ Erreur'}</span>
-<div class="lbl" style="margin-top:8px">Cycles: ${state.cycles}</div>
-<div class="lbl">Dernier: ${state.lastCycle?state.lastCycle.replace('T',' ').substring(0,19):'—'}</div></div>
-<div class="card"><h3>Configuration</h3>
-<div class="cfgrow"><div class="dot ${MGMT_COOKIES?'ok':''}"></div>Cookies my-managment ${MGMT_COOKIES?'✓':'✗ manquant'}</div>
-<div class="cfgrow"><div class="dot ${YAPSON_TOKEN?'ok':''}"></div>Token yapson ${YAPSON_TOKEN?'✓':'✗ manquant'}</div>
-<div class="cfgrow" style="color:#64748b">Réseau: ${YAPSON_NETWORK_NAME}</div>
-<div class="cfgrow" style="color:#64748b">Intervalle: ${intervalMin}min</div></div>
-<div class="card"><h3>Décaissements OK</h3>
-<div class="stat" style="color:#4ade80">${state.totalOk}</div>
-<div class="lbl">${state.totalFCFA.toLocaleString('fr-FR')} FCFA envoyés</div></div>
-<div class="card"><h3>Échecs</h3>
-<div class="stat" style="color:#f87171">${state.totalErr}</div>
-<div class="lbl">Solde: ${state.solde.toLocaleString('fr-FR')} FCFA</div></div></div>
-<div class="actions">
-<a class="btn btn-g" href="/run">▶ Lancer cycle</a>
-<a class="btn btn-b" href="/">↻ Actualiser</a>
-<a class="btn btn-r" href="/stop">⏹ Arrêter</a>
-<a class="btn btn-g" href="/start">▶ Démarrer</a></div>
-<div class="card" style="margin-bottom:12px">
-<h3>Journal</h3><div class="log" style="margin-top:8px">
-${logHtml||'<div class="le info"><span class="lt">—</span><span>Aucun log</span></div>'}</div></div>
-<div style="font-size:9px;color:#64748b;text-align:center;padding:8px">
-YapsonBot7 • Auto-refresh 30s •
-<a href="/health" style="color:#64748b">health</a> •
-<a href="/cookies" style="color:#fb923c">🔑 Renouveler cookies</a>
-</div></div></body></html>`);
-});
+<title>YapsonBot7</title><meta http-equiv="refresh" content="15">
+<style>
+:root{--bg:#0d1117;--s1:#161b22;--s2:#21262d;--s3:#30363d;--t:#e6edf3;--m:#8b949e;--g:#3fb950;--b:#58a6ff;--o:#f0883e;--r:#f85149;--p:#bc8cff;}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);font-family:'Courier New',monospace;color:var(--t);font-size:13px;padding:20px;min-height:100vh}
+.wrap{max-width:900px;margin:0 auto;display:flex;flex-direction:column;gap:16px}
+.statbar{display:flex;gap:8px;flex-wrap:wrap}
+.sc{background:var(--s1);border:1px solid var(--s3);border-radius:10px;padding:12px 20px;min-width:90px;text-align:center;flex:1}
+.sv{font-size:28px;font-weight:700;line-height:1}
+.sl{font-size:9px;color:var(--m);text-transform:uppercase;letter-spacing:1px;margin-top:4px}
+.sc.vc .sv{color:var(--g)}.sc.vm .sv{color:var(--o)}.sc.vf .sv{color:var(--b)}
+.sc.vp .sv{color:var(--p)}.sc.vs .sv{color:var(--t)}.sc.vr .sv{color:var(--r)}
+.card{background:var(--s1);border:1px solid var(--s3);border-radius:10px;overflow:hidden}
+.ch{padding:12px 16px;border-bottom:1px solid var(--s3);font-size:10px;font-weight:700;letter-spacing:2px;color:var(--m);text-transform:uppercase;display:flex;align-items:center;gap:8px}
+.cb{padding:16px}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:600px){.g2{grid-template-columns:1fr}}
+.frow{display:flex;flex-direction:column;gap:5px;margin-bottom:12px}
+.frow:last-child{margin-bottom:0}
+label{font-size:9px;font-weight:700;letter-spacing:1.5px;color:var(--m);text-transform:uppercase}
+input,select,textarea{width:100%;background:var(--s2);border:1px solid var(--s3);color:var(--t);border-radius:6px;padding:8px 10px;font-family:inherit;font-size:12px;outline:none}
+input:focus,select:focus,textarea:focus{border-color:var(--b)}
+.inline{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.inline input{width:80px}.il{font-size:11px;color:var(--m)}
+.btn{padding:9px 18px;border-radius:7px;font-family:inherit;font-size:11px;font-weight:700;cursor:pointer;border:none;text-decoration:none;display:inline-block}
+.btn-save{background:rgba(88,166,255,.15);color:var(--b);border:1px solid rgba(88,166,255,.4)}
+.btn-go{background:rgba(63,185,80,.2);color:var(--g);border:1px solid rgba(63,185,80,.4)}
+.btn-stop{background:rgba(248,81,73,.15);color:var(--r);border:1px solid rgba(248,81,73,.35)}
+.btn-gray{background:var(--s2);color:var(--m);border:1px solid var(--s3)}
+.btn:hover{filter:brightness(1.15)}
+.btns{display:flex;gap:8px;flex-wrap:wrap}
+.badge{display:inline-flex;align-items:center;gap:5px;border-radius:20px;padding:4px 12px;font-size:10px;font-weight:700}
+.badge .dot{width:7px;height:7px;border-radius:50%}
+.b-on{background:rgba(63,185,80,.15);color:var(--g);border:1px solid rgba(63,185,80,.3)}
+.b-on .dot{background:var(--g);animation:pulse 1.8s infinite}
+.b-off{background:rgba(139,148,158,.1);color:var(--m);border:1px solid rgba(139,148,158,.2)}
+.b-off .dot{background:var(--m)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.log{background:#0d1117;border-radius:7px;max-height:360px;overflow-y:auto;padding:8px;font-size:10px;line-height:2}
+.le{display:flex;gap:10px}.lt{color:var(--m);min-width:130px;flex-shrink:0}
+.ok span:last-child{color:var(--g)}.er span:last-child{color:var(--r)}
+.wa span:last-child{color:var(--o)}.dt span:last-child{color:var(--m)}
+.in span:last-child{color:var(--b)}
+.hint{background:rgba(240,136,62,.08);border:1px solid rgba(240,136,62,.2);border-radius:7px;padding:8px 12px;font-size:10px;color:var(--o);line-height:1.8;margin-top:8px}
+.hint b{color:var(--t)}
+.seclbl{font-size:11px;font-weight:700;margin-bottom:10px}
+</style></head><body><div class="wrap">
 
-app.get('/run', async (req, res) => { if(!state.running) runCycle().catch(e=>addLog('err',e.message)); res.redirect('/'); });
-app.get('/start', (req, res) => { startPolling(); res.redirect('/'); });
-app.get('/stop',  (req, res) => { stopPolling();  res.redirect('/'); });
-app.get('/health', (req, res) => res.json({ status:state.status, cycles:state.cycles, totalOk:state.totalOk, totalErr:state.totalErr, totalFCFA:state.totalFCFA, running:state.running, configured:!!(MGMT_COOKIES&&YAPSON_TOKEN) }));
-
-// ── Page /cookies — Renouvellement session 12h ────────────────
-app.get('/cookies', (req, res) => {
-  const ok  = req.query.ok  || '';
-  const msg = req.query.msg || '';
-  res.send(`<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>YapsonBot7 — Cookies</title>
-<style>*{box-sizing:border-box;margin:0;padding:0}
-body{background:#080810;font-family:Courier New,monospace;color:#e2e8f0;padding:24px;font-size:13px;min-height:100vh;display:flex;align-items:center;justify-content:center}
-.card{background:#10101a;border-radius:12px;border:1px solid rgba(255,255,255,.1);padding:28px 32px;max-width:560px;width:100%}
-h1{font-size:17px;font-weight:700;margin-bottom:6px;display:flex;align-items:center;gap:10px}
-.logo{width:32px;height:32px;border-radius:8px;background:#4ade80;display:flex;align-items:center;justify-content:center;font-weight:900;font-size:14px;color:#000}
-.sub{font-size:11px;color:#64748b;margin-bottom:20px;line-height:1.6}
-label{font-size:9px;font-weight:700;letter-spacing:1.5px;color:#64748b;text-transform:uppercase;display:block;margin-bottom:5px}
-textarea{width:100%;background:#18182a;border:1px solid rgba(255,255,255,.1);color:#e2e8f0;border-radius:7px;padding:9px 11px;font-family:Courier New,monospace;font-size:10px;outline:none;margin-bottom:14px;resize:vertical;min-height:70px;line-height:1.6}
-textarea:focus{border-color:#60a5fa}
-.btn{width:100%;padding:11px;background:rgba(74,222,128,.2);border:1px solid rgba(74,222,128,.4);color:#4ade80;border-radius:8px;font-family:Courier New,monospace;font-size:12px;font-weight:700;cursor:pointer}
-.alert{border-radius:7px;padding:10px 13px;font-size:11px;margin-bottom:16px}
-.alert-ok{background:rgba(74,222,128,.1);border:1px solid rgba(74,222,128,.3);color:#4ade80}
-.alert-err{background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.3);color:#f87171}
-.hint{background:#18182a;border-radius:7px;padding:10px 13px;font-size:10px;color:#64748b;margin-bottom:16px;line-height:1.8}
-.hint b{color:#60a5fa}a{color:#60a5fa;text-decoration:none}
-</style></head><body><div class="card">
-<h1><div class="logo">7</div>Renouveler les cookies</h1>
-<p class="sub">Session my-managment.com expire toutes les 12h — colle les nouveaux cookies ici.</p>
-${ok?'<div class="alert alert-ok">✔ Cookies mis à jour — bot redémarré</div>':''}
-${msg&&!ok?'<div class="alert alert-err">✘ '+msg+'</div>':''}
-<div class="hint">
-<b>Cookies my-managment :</b><br>
-F12 → Application → Cookies → copier format nom=valeur; nom2=valeur2<br><br>
-<b>Token yapson (agg.yapson.net) :</b><br>
-F12 → Console → <b>copy(localStorage.getItem('accessToken'))</b>
+<div class="statbar">
+<div class="sc vc"><div class="sv">${stats.confirmed}</div><div class="sl">Confirmés</div></div>
+<div class="sc vm"><div class="sv">${stats.missing}</div><div class="sl">Manquants</div></div>
+<div class="sc vf"><div class="sv">${stats.fixed}</div><div class="sl">Corrigés</div></div>
+<div class="sc vp"><div class="sv">${stats.polls}</div><div class="sl">Polls</div></div>
+<div class="sc vs"><div class="sv">0</div><div class="sl">SMS</div></div>
+<div class="sc vr"><div class="sv">${stats.rejected}</div><div class="sl">Rejetés</div></div>
 </div>
-<form method="POST" action="/cookies">
-<label>Cookies my-managment.com</label>
-<textarea name="cookies" placeholder="sessionid=abc; csrftoken=xyz..." required></textarea>
-<label>Token yapson</label>
-<textarea name="token" placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." rows="3" required></textarea>
-<button class="btn" type="submit">✔ Mettre à jour et redémarrer</button>
+
+<div class="card">
+<div class="ch"><span>🔑</span> COMPTES</div>
+<div class="cb">
+<form method="POST" action="/save-accounts">
+<div class="g2">
+<div>
+<div class="seclbl" style="color:var(--b)">agg.yapson.net</div>
+<div class="frow"><label>Token yapson</label>
+<input type="password" name="yapsonToken" value="${cfg.yapsonToken?'●'.repeat(20):''}" placeholder="eyJhbGci..."></div>
+<div class="hint">F12 → Console → <b>copy(localStorage.getItem('accessToken'))</b></div>
+</div>
+<div>
+<div class="seclbl" style="color:var(--g)">my-managment.com</div>
+<div class="frow"><label>Cookies de session</label>
+<textarea name="mgmtCookies" rows="3" placeholder="PHPSESSID=...; auid=...">${cfg.mgmtCookies?'(configuré — coller pour remplacer)':''}</textarea></div>
+<div class="hint">F12 → Application → Cookies → <b>nom=valeur; nom2=valeur2</b></div>
+</div>
+</div>
+<div style="margin-top:14px"><button class="btn btn-save" type="submit">💾 Sauvegarder</button></div>
 </form>
-<div style="text-align:center;margin-top:14px;font-size:10px"><a href="/">← Dashboard</a></div>
+</div></div>
+
+<div class="card">
+<div class="ch"><span>⚙️</span> CONFIGURATION</div>
+<div class="cb">
+<form method="POST" action="/save-config">
+<div class="frow"><label>Réseau</label>
+<select name="network">${netOpts}</select></div>
+<div class="frow">
+<div class="inline">
+<span class="il">Intervalle :</span>
+<input type="number" name="pollInterval" value="${cfg.pollInterval}" min="60" max="86400" style="width:90px">
+<span class="il">s</span>
+<span class="il" style="margin-left:16px">Solde max :</span>
+<input type="number" name="maxSolde" value="${cfg.maxSolde}" min="0" style="width:120px">
+<span class="il">FCFA (0 = illimité)</span>
+</div></div>
+<div style="margin-top:14px"><button class="btn btn-save" type="submit">💾 Appliquer</button></div>
+</form>
+</div></div>
+
+<div class="card">
+<div class="ch"><span>▶</span> CONTRÔLES</div>
+<div class="cb">
+<span class="${botActive?'badge b-on':'badge b-off'}">
+<span class="dot"></span>${botActive?'Actif — toutes les '+cfg.pollInterval+'s':'Arrêté'}</span>
+<div class="btns" style="margin-top:14px">
+<a class="btn ${botActive?'btn-gray':'btn-go'}" href="/start">▶ Démarrer</a>
+<a class="btn ${botActive?'btn-stop':'btn-gray'}" href="/stop">■ Arrêter</a>
+<a class="btn btn-gray" href="/run">↻ Lancer cycle</a>
+<a class="btn btn-gray" href="/reset">◌ Reset stats</a>
+<a class="btn btn-gray" href="/">⟳ Actualiser</a>
+</div>
+</div></div>
+
+<div class="card">
+<div class="ch"><span>📋</span> JOURNAL — ${logs.length} entrées</div>
+<div class="cb" style="padding:8px">
+<div class="log">${logHtml||'<div class="le in"><span class="lt">—</span><span>▸ En attente</span></div>'}</div>
+</div></div>
+
 </div></body></html>`);
 });
 
-app.post('/cookies', express.urlencoded({ extended: true }), (req, res) => {
-  const { cookies, token } = req.body || {};
-  if (!cookies || cookies.trim().length < 10) return res.redirect('/cookies?msg=Cookies+invalides');
-  if (!token  || token.trim().length  < 20) return res.redirect('/cookies?msg=Token+invalide');
-  MGMT_COOKIES = cookies.trim();
-  YAPSON_TOKEN  = token.trim();
-  addLog('ok', `Cookies mis à jour (${MGMT_COOKIES.length} chars) — redémarrage`);
-  stopPolling();
-  setTimeout(() => startPolling(), 500);
-  res.redirect('/cookies?ok=1');
+app.post('/save-accounts',(req,res)=>{
+  const {yapsonToken,mgmtCookies}=req.body;
+  if(yapsonToken&&!yapsonToken.startsWith('●'))cfg.yapsonToken=yapsonToken.trim();
+  if(mgmtCookies&&!mgmtCookies.includes('configuré'))cfg.mgmtCookies=mgmtCookies.trim();
+  addLog('ok','Comptes mis à jour');
+  if(botActive){stopPolling();setTimeout(startPolling,500);}
+  res.redirect('/');
 });
+app.post('/save-config',(req,res)=>{
+  const{network,pollInterval,maxSolde}=req.body;
+  if(network&&NET_UUIDS[network])cfg.network=network;
+  if(pollInterval)cfg.pollInterval=Math.max(60,parseInt(pollInterval));
+  if(maxSolde!==undefined)cfg.maxSolde=parseInt(maxSolde)||0;
+  addLog('ok',`Config: réseau=${cfg.network} intervalle=${cfg.pollInterval}s`);
+  if(botActive){stopPolling();setTimeout(startPolling,500);}
+  res.redirect('/');
+});
+app.get('/start',(req,res)=>{startPolling();res.redirect('/');});
+app.get('/stop', (req,res)=>{stopPolling(); res.redirect('/');});
+app.get('/run',  async(req,res)=>{runCycle().catch(e=>addLog('err',e.message));res.redirect('/');});
+app.get('/reset',(req,res)=>{Object.keys(stats).forEach(k=>stats[k]=0);logs.length=0;addLog('info','Stats réinitialisées');res.redirect('/');});
+app.get('/health',(req,res)=>res.json({...stats,botActive,network:cfg.network,interval:cfg.pollInterval}));
+app.get('/cookies',(req,res)=>res.redirect('/'));
 
-// ── Démarrage ─────────────────────────────────────────────────
-app.listen(PORT, () => {
-  addLog('info', `YapsonBot7 démarré — port ${PORT}`);
-  addLog('info', `Réseau: ${YAPSON_NETWORK_NAME}`);
-  addLog('info', `Intervalle: ${POLL_INTERVAL/60000}min`);
-  addLog('info', `Cookies: ${MGMT_COOKIES ? 'OK' : 'MANQUANT → aller sur /cookies'}`);
-  addLog('info', `Token:   ${YAPSON_TOKEN  ? 'OK' : 'MANQUANT → aller sur /cookies'}`);
-  if (MGMT_COOKIES && YAPSON_TOKEN) startPolling();
-  else addLog('warn', 'Aller sur /cookies pour configurer');
+app.listen(PORT,()=>{
+  addLog('info',`YapsonBot7 démarré — port ${PORT}`);
+  addLog('info',`Réseau: ${cfg.network} | Intervalle: ${cfg.pollInterval}s`);
+  addLog('info',`Cookies: ${cfg.mgmtCookies?'OK':'MANQUANT'} | Token: ${cfg.yapsonToken?'OK':'MANQUANT'}`);
+  if(cfg.mgmtCookies&&cfg.yapsonToken)startPolling();
+  else addLog('warn','Remplir les comptes dans le dashboard pour démarrer');
 });
