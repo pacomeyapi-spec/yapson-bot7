@@ -22,6 +22,7 @@ const NET_UUIDS = {
 let cfg = {
   mgmtCookies  : process.env.MGMT_COOKIES  || '',
   yapsonToken  : process.env.YAPSON_TOKEN  || '',
+  reportId     : process.env.REPORT_ID     || '8231c3be3216307da83c067d263c09ec',
   network      : process.env.YAPSON_NETWORK|| 'Orangeint',
   pollInterval : parseInt(process.env.POLL_INTERVAL || '900'),
   maxSolde     : parseInt(process.env.MAX_SOLDE || '0'),
@@ -30,7 +31,6 @@ let cfg = {
 const stats = { confirmed: 0, missing: 0, fixed: 0, polls: 0, rejected: 0 };
 const logs  = [];
 let pollTimer = null, isRunning = false, botActive = false;
-let cookiesOk = false;
 
 function addLog(type, msg) {
   const ts = new Date().toISOString().replace('T',' ').substring(0,19);
@@ -39,7 +39,6 @@ function addLog(type, msg) {
   console.log(`[${type.toUpperCase()}] ${ts} — ${msg}`);
 }
 
-// ── Parser cookies: JSON array ou string nom=val ───────────────
 function parseCookies(raw) {
   if (!raw) return '';
   const s = raw.trim();
@@ -52,9 +51,7 @@ function parseCookies(raw) {
   return s;
 }
 
-function getCookieStr() {
-  return parseCookies(cfg.mgmtCookies);
-}
+function getCookieStr() { return parseCookies(cfg.mgmtCookies); }
 
 function mgmtH() {
   return {
@@ -71,27 +68,13 @@ function yapH() {
   return { 'Content-Type':'application/json', 'Authorization': `Bearer ${cfg.yapsonToken}` };
 }
 
-// ── Vérifier validité session ──────────────────────────────────
-async function checkSession() {
-  if (!getCookieStr()) return false;
-  try {
-    const r = await fetch('https://my-managment.com/admin/report/pendingrequestwithdrawal', {
-      method:'POST', headers:mgmtH(), body:JSON.stringify({page:1,limit:1}),
-    });
-    if (!r.ok) return false;
-    const d = await r.json();
-    return !d.is_guest;
-  } catch(e) { return false; }
-}
-
-// ── Retraits ───────────────────────────────────────────────────
 async function getWithdrawals() {
   const res = await fetch('https://my-managment.com/admin/report/pendingrequestwithdrawal', {
     method:'POST', headers:mgmtH(), body:JSON.stringify({page:1,limit:500}),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status} — cookies expirés ?`);
   const data = await res.json();
-  if (data.is_guest) throw new Error('Session expirée — injecter nouveaux cookies');
+  if (data.is_guest) throw new Error('Session expirée — injecter nouveaux cookies via le dashboard');
   const rows = data.data || [];
   const out=[]; let cumul=0;
   const solde = cfg.maxSolde>0 ? cfg.maxSolde : 99999999;
@@ -137,7 +120,7 @@ async function confirmW(item) {
   fd.append('subagent_id' , String(cd.subagent_id));
   fd.append('ref_id'      , String(cd.ref_id||1));
   fd.append('bank_id'     , cd.bank_id ? String(cd.bank_id) : 'null');
-  fd.append('report_id'   , '');
+  fd.append('report_id'   , cfg.reportId);  // ← hash fixe du compte, OBLIGATOIRE
   const h = {
     'Accept'          : 'application/json, text/plain, */*',
     'X-Requested-With': 'XMLHttpRequest',
@@ -209,7 +192,6 @@ function stopPolling(){
   botActive=false; addLog('warn','Bot arrêté');
 }
 
-// ── Dashboard ──────────────────────────────────────────────────
 app.get('/',(req,res)=>{
   const logHtml=logs.slice(0,100).map(e=>{
     const cls=e.type==='ok'?'ok':e.type==='err'?'er':e.type==='warn'?'wa':e.type==='dot'?'dt':'in';
@@ -218,50 +200,33 @@ app.get('/',(req,res)=>{
   }).join('');
   const netOpts=Object.keys(NET_UUIDS).map(n=>`<option value="${n}" ${n===cfg.network?'selected':''}>${n}</option>`).join('');
   const hasSession = getCookieStr().length > 20;
-  
-  const cookieAlert = !hasSession ? `
-  <div class="alert-box">
+  const cookieAlert = !hasSession ? `<div class="alert-box">
     <div class="alert-title">🍪 Cookies my-managment requis</div>
-    <div class="alert-body">
-      my-managment utilise un reCAPTCHA qui bloque le login automatique.<br>
-      <strong>Comment obtenir tes cookies :</strong><br>
-      1. Connecte-toi sur my-managment.com dans ton navigateur<br>
-      2. Appuie sur <kbd>F12</kbd> → onglet <strong>Application → Cookies → my-managment.com</strong><br>
-      3. Clique droit sur les cookies → <strong>Copy all as JSON</strong><br>
-      &nbsp;&nbsp; ou utilise l'extension "EditThisCookie" → Exporter<br>
-      4. Colle le JSON ci-dessous et clique Injecter
-    </div>
+    <div class="alert-body">my-managment utilise un reCAPTCHA qui bloque le login automatique.<br>
+    <strong>Comment obtenir tes cookies :</strong><br>
+    1. Connecte-toi sur my-managment.com dans ton navigateur<br>
+    2. Appuie sur <kbd>F12</kbd> → onglet <strong>Application → Cookies → my-managment.com</strong><br>
+    3. Clique droit sur les cookies → <strong>Copy all as JSON</strong><br>
+    4. Colle le JSON ci-dessous et clique Injecter</div>
     <form method="POST" action="/inject-cookies">
-      <textarea name="cookies" placeholder='[{"name":"session","value":"...","domain":".my-managment.com",...}]'></textarea>
+      <textarea name="cookies" placeholder='[{"name":"auid","value":"..."},{"name":"PHPSESSID","value":"..."}]'></textarea>
       <button class="btn btn-inject" type="submit">🍪 Injecter les cookies</button>
-    </form>
-  </div>` : '';
-
+    </form></div>` : '';
   res.send(`<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>YapsonBot7</title><meta http-equiv="refresh" content="15">
-<style>
-:root{--bg:#0d1117;--s1:#161b22;--s2:#21262d;--s3:#30363d;--t:#e6edf3;--m:#8b949e;--g:#3fb950;--b:#58a6ff;--o:#f0883e;--r:#f85149;--p:#bc8cff;--pk:#ff79c6;}
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);font-family:'Courier New',monospace;color:var(--t);font-size:13px;padding:20px;min-height:100vh}
+<style>:root{--bg:#0d1117;--s1:#161b22;--s2:#21262d;--s3:#30363d;--t:#e6edf3;--m:#8b949e;--g:#3fb950;--b:#58a6ff;--o:#f0883e;--r:#f85149;--p:#bc8cff;}
+*{box-sizing:border-box;margin:0;padding:0}body{background:var(--bg);font-family:'Courier New',monospace;color:var(--t);font-size:13px;padding:20px}
 .wrap{max-width:900px;margin:0 auto;display:flex;flex-direction:column;gap:16px}
-
-/* Alert box cookies */
-.alert-box{background:#1a1040;border:2px solid #6c3fc5;border-radius:12px;padding:20px;margin-bottom:4px}
+.alert-box{background:#1a1040;border:2px solid #6c3fc5;border-radius:12px;padding:20px}
 .alert-title{font-size:15px;font-weight:700;color:#c79fff;margin-bottom:12px}
 .alert-body{font-size:11px;color:#b8a4e8;line-height:2;margin-bottom:14px}
-.alert-body strong{color:var(--t)}
-kbd{background:var(--s2);border:1px solid var(--s3);border-radius:3px;padding:1px 5px;font-size:10px}
+.alert-body strong{color:var(--t)}kbd{background:var(--s2);border:1px solid var(--s3);border-radius:3px;padding:1px 5px;font-size:10px}
 .alert-box textarea{width:100%;height:80px;background:#0d0820;border:1px solid #6c3fc5;color:#c79fff;border-radius:7px;padding:10px;font-family:inherit;font-size:10px;outline:none;resize:vertical}
-.alert-box textarea:focus{border-color:var(--pk)}
-
-/* Stats */
 .statbar{display:flex;gap:8px;flex-wrap:wrap}
 .sc{background:var(--s1);border:1px solid var(--s3);border-radius:10px;padding:12px 20px;min-width:90px;text-align:center;flex:1}
 .sv{font-size:28px;font-weight:700;line-height:1}.sl{font-size:9px;color:var(--m);text-transform:uppercase;letter-spacing:1px;margin-top:4px}
 .sc.vc .sv{color:var(--g)}.sc.vm .sv{color:var(--o)}.sc.vf .sv{color:var(--b)}.sc.vp .sv{color:var(--p)}.sc.vs .sv{color:var(--t)}.sc.vr .sv{color:var(--r)}
-
-/* Cards */
 .card{background:var(--s1);border:1px solid var(--s3);border-radius:10px;overflow:hidden}
 .ch{padding:12px 16px;border-bottom:1px solid var(--s3);font-size:10px;font-weight:700;letter-spacing:2px;color:var(--m);text-transform:uppercase;display:flex;align-items:center;gap:8px}
 .cb{padding:16px}.g2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
@@ -271,8 +236,6 @@ label{font-size:9px;font-weight:700;letter-spacing:1.5px;color:var(--m);text-tra
 input,select,textarea{width:100%;background:var(--s2);border:1px solid var(--s3);color:var(--t);border-radius:6px;padding:8px 10px;font-family:inherit;font-size:12px;outline:none}
 input:focus,select:focus,textarea:focus{border-color:var(--b)}
 .inline{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.il{font-size:11px;color:var(--m)}
-
-/* Buttons */
 .btn{padding:9px 18px;border-radius:7px;font-family:inherit;font-size:11px;font-weight:700;cursor:pointer;border:none;text-decoration:none;display:inline-block}
 .btn-save{background:rgba(88,166,255,.15);color:var(--b);border:1px solid rgba(88,166,255,.4)}
 .btn-go{background:rgba(63,185,80,.2);color:var(--g);border:1px solid rgba(63,185,80,.4)}
@@ -280,35 +243,24 @@ input:focus,select:focus,textarea:focus{border-color:var(--b)}
 .btn-gray{background:var(--s2);color:var(--m);border:1px solid var(--s3)}
 .btn-inject{background:#6c3fc5;color:#fff;border:none;padding:10px 20px;font-size:12px;margin-top:10px}
 .btn:hover{filter:brightness(1.15)}.btns{display:flex;gap:8px;flex-wrap:wrap}
-
-/* Badge */
 .badge{display:inline-flex;align-items:center;gap:5px;border-radius:20px;padding:4px 12px;font-size:10px;font-weight:700}
 .badge .dot{width:7px;height:7px;border-radius:50%}
 .b-on{background:rgba(63,185,80,.15);color:var(--g);border:1px solid rgba(63,185,80,.3)}
 .b-on .dot{background:var(--g);animation:pulse 1.8s infinite}
 .b-off{background:rgba(139,148,158,.1);color:var(--m);border:1px solid rgba(139,148,158,.2)}
 .b-off .dot{background:var(--m)}
-.b-warn{background:rgba(240,136,62,.1);color:var(--o);border:1px solid rgba(240,136,62,.3)}
-.b-warn .dot{background:var(--o);animation:pulse 1s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-
-/* Log */
 .log{background:#0d1117;border-radius:7px;max-height:400px;overflow-y:auto;padding:8px;font-size:10px;line-height:2;word-break:break-word}
 .le{display:flex;gap:10px}.lt{color:var(--m);min-width:135px;flex-shrink:0}
 .ok span:last-child{color:var(--g)}.er span:last-child{color:var(--r)}.wa span:last-child{color:var(--o)}.dt span:last-child{color:var(--m)}.in span:last-child{color:var(--b)}
-
-/* Tags */
+.hint{border-radius:7px;padding:8px 12px;font-size:10px;line-height:1.8;margin-top:8px}
+.hint-g{background:rgba(63,185,80,.08);border:1px solid rgba(63,185,80,.2);color:var(--g)}
+.hint-w{background:rgba(240,136,62,.08);border:1px solid rgba(240,136,62,.2);color:var(--o)}.hint b{color:var(--t)}
+.seclbl{font-size:11px;font-weight:700;margin-bottom:10px}
 .tag-ok{display:inline-block;background:rgba(63,185,80,.15);color:var(--g);border:1px solid rgba(63,185,80,.3);border-radius:4px;padding:1px 7px;font-size:9px;margin-left:6px}
 .tag-err{display:inline-block;background:rgba(248,81,73,.15);color:var(--r);border:1px solid rgba(248,81,73,.3);border-radius:4px;padding:1px 7px;font-size:9px;margin-left:6px}
-.hint{border-radius:7px;padding:8px 12px;font-size:10px;line-height:1.8;margin-top:8px}
-.hint-w{background:rgba(240,136,62,.08);border:1px solid rgba(240,136,62,.2);color:var(--o)}
-.hint-g{background:rgba(63,185,80,.08);border:1px solid rgba(63,185,80,.2);color:var(--g)}
-.hint b{color:var(--t)}
-.seclbl{font-size:11px;font-weight:700;margin-bottom:10px}
 </style></head><body><div class="wrap">
-
 ${cookieAlert}
-
 <div class="statbar">
 <div class="sc vc"><div class="sv">${stats.confirmed}</div><div class="sl">Confirmés</div></div>
 <div class="sc vm"><div class="sv">${stats.missing}</div><div class="sl">Manquants</div></div>
@@ -317,31 +269,22 @@ ${cookieAlert}
 <div class="sc vs"><div class="sv">0</div><div class="sl">SMS</div></div>
 <div class="sc vr"><div class="sv">${stats.rejected}</div><div class="sl">Rejetés</div></div>
 </div>
-
 <div class="card"><div class="ch"><span>🔑</span> COMPTES</div><div class="cb">
 <form method="POST" action="/save-accounts"><div class="g2">
-<div>
-<div class="seclbl" style="color:var(--b)">agg.yapson.net</div>
+<div><div class="seclbl" style="color:var(--b)">agg.yapson.net</div>
 <div class="frow"><label>Token yapson</label>
 <input type="password" name="yapsonToken" value="${cfg.yapsonToken?'●'.repeat(20):''}" placeholder="eyJhbGci...">
 ${cfg.yapsonToken?'<span class="tag-ok">✓ OK</span>':'<span class="tag-err">✗ manquant</span>'}
-</div>
-<div class="hint hint-w" style="font-size:9px">F12 → Console → <b>copy(localStorage.getItem('accessToken'))</b></div>
-</div>
-<div>
-<div class="seclbl" style="color:var(--g)">my-managment.com</div>
+</div></div>
+<div><div class="seclbl" style="color:var(--g)">my-managment.com</div>
 <div class="frow"><label>Cookies de session</label>
-<textarea name="mgmtCookies" rows="3" placeholder='[{"name":"auid",...}]&#10;ou: PHPSESSID=...; auid=...'>${cfg.mgmtCookies?'(configuré — coller pour remplacer)':''}</textarea>
-${hasSession?'<span class="tag-ok">✓ Session active</span>':'<span class="tag-err">✗ Cookies requis</span>'}
+<textarea name="mgmtCookies" rows="3" placeholder='[{"name":"auid",...}] ou PHPSESSID=...; auid=...'>${cfg.mgmtCookies?'(configuré — coller pour remplacer)':''}</textarea>
+${hasSession?'<span class="tag-ok">✓ Session active</span>':'<span class="tag-err">✗ Requis</span>'}
 </div>
-<div class="hint ${hasSession?'hint-g':'hint-w'}" style="font-size:9px">
-${hasSession?'✔ Session active — expire dans ~12h. Réinjecter si erreurs.':'⚠ Coller le JSON Firefox ou PHPSESSID=...; auid=...'}
-</div>
-</div>
-</div>
+<div class="hint ${hasSession?'hint-g':'hint-w'}" style="font-size:9px">${hasSession?'✔ Session active — expire ~12h':'⚠ Coller JSON Firefox ou PHPSESSID=...; auid=...'}</div>
+</div></div>
 <div style="margin-top:14px"><button class="btn btn-save" type="submit">💾 Sauvegarder</button></div>
 </form></div></div>
-
 <div class="card"><div class="ch"><span>⚙️</span> CONFIGURATION</div><div class="cb">
 <form method="POST" action="/save-config">
 <div class="frow"><label>Réseau</label><select name="network">${netOpts}</select></div>
@@ -351,10 +294,8 @@ ${hasSession?'✔ Session active — expire dans ~12h. Réinjecter si erreurs.':
 </div></div>
 <div style="margin-top:14px"><button class="btn btn-save" type="submit">💾 Appliquer</button></div>
 </form></div></div>
-
 <div class="card"><div class="ch"><span>▶</span> CONTRÔLES</div><div class="cb">
-<span class="${botActive?'badge b-on':hasSession?'badge b-off':'badge b-warn'}">
-<span class="dot"></span>${botActive?'Actif — toutes les '+cfg.pollInterval+'s':hasSession?'Arrêté':'Cookies requis'}</span>
+<span class="${botActive?'badge b-on':'badge b-off'}"><span class="dot"></span>${botActive?'Actif — toutes les '+cfg.pollInterval+'s':'Arrêté'}</span>
 <div class="btns" style="margin-top:14px">
 <a class="btn ${botActive?'btn-gray':'btn-go'}" href="/start">▶ Démarrer</a>
 <a class="btn ${botActive?'btn-stop':'btn-gray'}" href="/stop">■ Arrêter</a>
@@ -362,31 +303,24 @@ ${hasSession?'✔ Session active — expire dans ~12h. Réinjecter si erreurs.':
 <a class="btn btn-gray" href="/reset">◌ Reset stats</a>
 <a class="btn btn-gray" href="/">⟳ Actualiser</a>
 </div></div></div>
-
 <div class="card"><div class="ch"><span>📋</span> JOURNAL — ${logs.length} entrées</div>
 <div class="cb" style="padding:8px"><div class="log">${logHtml||'<div class="le in"><span class="lt">—</span><span>▸ En attente</span></div>'}</div>
-</div></div>
-</div></body></html>`);
+</div></div></div></body></html>`);
 });
 
-// ── Route injection cookies (depuis le dashboard ou le formulaire alert) ──
 app.post('/inject-cookies',(req,res)=>{
-  const raw = req.body.cookies || req.body.mgmtCookies || '';
-  if (!raw || raw.includes('configuré')) { res.redirect('/'); return; }
+  const raw = req.body.cookies||'';
+  if(!raw||raw.includes('configuré')){res.redirect('/');return;}
   cfg.mgmtCookies = raw.trim();
-  const parsed = parseCookies(cfg.mgmtCookies);
-  const count  = parsed.split(';').length;
-  addLog('ok',`🍪 Cookies injectés — ${count} cookie(s)`);
-  if (!botActive && cfg.yapsonToken) startPolling();
+  addLog('ok',`🍪 Cookies injectés — ${parseCookies(cfg.mgmtCookies).split(';').length} cookie(s)`);
+  if(!botActive&&cfg.yapsonToken)startPolling();
   res.redirect('/');
 });
-
 app.post('/save-accounts',(req,res)=>{
   const{yapsonToken,mgmtCookies}=req.body;
   if(yapsonToken&&!yapsonToken.startsWith('●'))cfg.yapsonToken=yapsonToken.trim();
   if(mgmtCookies&&!mgmtCookies.includes('configuré'))cfg.mgmtCookies=mgmtCookies.trim();
-  const parsed=parseCookies(cfg.mgmtCookies);
-  addLog('ok',`Comptes mis à jour — ${parsed.split(';').length} cookie(s)`);
+  addLog('ok',`Comptes mis à jour — ${parseCookies(cfg.mgmtCookies).split(';').length} cookie(s)`);
   if(botActive){stopPolling();setTimeout(startPolling,500);}
   res.redirect('/');
 });
@@ -399,22 +333,22 @@ app.post('/save-config',(req,res)=>{
   if(botActive){stopPolling();setTimeout(startPolling,500);}
   res.redirect('/');
 });
-app.get('/start', (req,res)=>{startPolling();res.redirect('/');});
-app.get('/stop',  (req,res)=>{stopPolling(); res.redirect('/');});
-app.get('/run',   async(req,res)=>{runCycle().catch(e=>addLog('err',e.message));res.redirect('/');});
-app.get('/reset', (req,res)=>{Object.keys(stats).forEach(k=>stats[k]=0);logs.length=0;addLog('info','Reset');res.redirect('/');});
+app.get('/start',(req,res)=>{startPolling();res.redirect('/');});
+app.get('/stop', (req,res)=>{stopPolling(); res.redirect('/');});
+app.get('/run',  async(req,res)=>{runCycle().catch(e=>addLog('err',e.message));res.redirect('/');});
+app.get('/reset',(req,res)=>{Object.keys(stats).forEach(k=>stats[k]=0);logs.length=0;addLog('info','Reset');res.redirect('/');});
 app.get('/health',(req,res)=>res.json({...stats,botActive,network:cfg.network,interval:cfg.pollInterval,hasSession:getCookieStr().length>20}));
 app.get('/cookies',(req,res)=>res.redirect('/'));
 
 app.listen(PORT,()=>{
   addLog('info',`YapsonBot7 démarré — port ${PORT}`);
   addLog('info',`Réseau: ${cfg.network} | Intervalle: ${cfg.pollInterval}s`);
-  const p = parseCookies(cfg.mgmtCookies);
+  addLog('info',`report_id: ${cfg.reportId}`);
+  const p=parseCookies(cfg.mgmtCookies);
   if(p){
     addLog('info',`Cookies: ${p.split(';').length} ok | Token: ${cfg.yapsonToken?'OK':'MANQUANT'}`);
-    if(cfg.yapsonToken) startPolling();
-    else addLog('warn','Token yapson manquant');
+    if(cfg.yapsonToken)startPolling();
   } else {
-    addLog('warn','Cookies my-managment manquants — aller sur le dashboard pour injecter');
+    addLog('warn','Cookies manquants — aller sur le dashboard pour injecter');
   }
 });
