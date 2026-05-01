@@ -1,5 +1,5 @@
 // ============================================================
-// YAPSON-BOT7 — Automatisation des retraits
+// YAPSON-BOT7 — Auto-login + Automatisation des retraits
 // ============================================================
 
 const express  = require('express');
@@ -11,15 +11,6 @@ const PORT = process.env.PORT || 8080;
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// CORS pour autoriser le bookmarklet my-managment a envoyer les cookies
-app.use(function(req, res, next) {
-  res.setHeader('Access-Control-Allow-Origin', 'https://my-managment.com');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
-  next();
-});
-
 const NET_UUIDS = {
   'MOOV CI'  : '24462fd9-c8e2-42f2-a95f-119844bc2ada',
   'MTN CI'   : '77e8e729-a0f1-4e1b-8614-168c77f4b101',
@@ -29,17 +20,23 @@ const NET_UUIDS = {
 };
 
 let cfg = {
-  mgmtCookies  : process.env.MGMT_COOKIES   || '',
-  yapsonToken  : process.env.YAPSON_TOKEN   || '',
-  network      : process.env.YAPSON_NETWORK || 'Orangeint',
+  mgmtLogin    : process.env.MGMT_LOGIN    || '',
+  mgmtPassword : process.env.MGMT_PASSWORD || '',
+  mgmtCookies  : process.env.MGMT_COOKIES  || '',  // fallback manuel
+  yapsonToken  : process.env.YAPSON_TOKEN  || '',
+  network      : process.env.YAPSON_NETWORK|| 'Orangeint',
   pollInterval : parseInt(process.env.POLL_INTERVAL || '900'),
   maxSolde     : parseInt(process.env.MAX_SOLDE || '0'),
 };
 
+// Session dynamique (renouvellée automatiquement)
+let sessionCookies = '';
+let lastLoginTime  = 0;
+const SESSION_TTL  = 10 * 60 * 60 * 1000; // 10h en ms
+
 const stats = { confirmed: 0, missing: 0, fixed: 0, polls: 0, rejected: 0 };
 const logs  = [];
 let pollTimer = null, isRunning = false, botActive = false;
-let lastCookieUpdate = null;
 
 function addLog(type, msg) {
   const ts = new Date().toISOString().replace('T',' ').substring(0,19);
@@ -60,13 +57,18 @@ function parseCookies(raw) {
   return s;
 }
 
-function mgmtH() {
+// Retourne les cookies actifs (session ou fallback)
+function getActiveCookies() {
+  return sessionCookies || parseCookies(cfg.mgmtCookies);
+}
+
+function mgmtH(extraContentType) {
   return {
     'Accept'           : 'application/json, text/plain, */*',
-    'Content-Type'     : 'application/json',
+    'Content-Type'     : extraContentType || 'application/json',
     'X-Requested-With' : 'XMLHttpRequest',
     'X-Time-Zone'      : 'GMT+00',
-    'Cookie'           : parseCookies(cfg.mgmtCookies),
+    'Cookie'           : getActiveCookies(),
     'User-Agent'       : 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
     'Referer'          : 'https://my-managment.com/fr/admin/report/pendingrequestwithdrawal',
   };
@@ -75,12 +77,119 @@ function yapH() {
   return { 'Content-Type':'application/json', 'Authorization': `Bearer ${cfg.yapsonToken}` };
 }
 
+// ── AUTO-LOGIN ─────────────────────────────────────────────────
+async function autoLogin() {
+  if (!cfg.mgmtLogin || !cfg.mgmtPassword) {
+    addLog('warn', 'Pas de login/password — utilisation cookies manuels');
+    return false;
+  }
+  addLog('info', `Connexion automatique: ${cfg.mgmtLogin}...`);
+  try {
+    // Step 1: GET la page login pour récupérer les cookies initiaux
+    const r1 = await fetch('https://my-managment.com/signin/', {
+      method: 'GET',
+      headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36' },
+      redirect: 'manual',
+    });
+    const initCookies = (r1.headers.raw()['set-cookie'] || [])
+      .map(c => c.split(';')[0]).join('; ');
+
+    // Step 2: POST login
+    const fd = new FormData();
+    fd.append('login', cfg.mgmtLogin);
+    fd.append('password', cfg.mgmtPassword);
+    fd.append('remember', '1');
+
+    const r2 = await fetch('https://my-managment.com/admin/auth/login', {
+      method: 'POST',
+      headers: {
+        'Cookie'     : initCookies,
+        'Referer'    : 'https://my-managment.com/signin/',
+        'User-Agent' : 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+        ...fd.getHeaders(),
+      },
+      body: fd,
+      redirect: 'manual',
+    });
+
+    // Collecter tous les cookies de la réponse
+    const newCookies = (r2.headers.raw()['set-cookie'] || [])
+      .map(c => c.split(';')[0]);
+
+    if (newCookies.length === 0 && r2.status !== 302) {
+      // Essayer format JSON
+      const r3 = await fetch('https://my-managment.com/admin/auth/login', {
+        method: 'POST',
+        headers: {
+          'Content-Type'  : 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
+          'Cookie'        : initCookies,
+          'Referer'       : 'https://my-managment.com/signin/',
+          'User-Agent'    : 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+        },
+        body: JSON.stringify({ login: cfg.mgmtLogin, password: cfg.mgmtPassword }),
+        redirect: 'manual',
+      });
+      const c3 = (r3.headers.raw()['set-cookie'] || []).map(c => c.split(';')[0]);
+      if (c3.length > 0) {
+        // Fusionner avec cookies initiaux
+        const merged = [...initCookies.split('; ').filter(Boolean), ...c3];
+        sessionCookies = merged.join('; ');
+        lastLoginTime = Date.now();
+        addLog('ok', `✔ Session JSON — ${c3.length} cookie(s) nouveaux`);
+        return true;
+      }
+      addLog('err', `Login échoué: status=${r3.status}`);
+      return false;
+    }
+
+    // Fusionner cookies initiaux + nouveaux
+    const allCookies = [
+      ...initCookies.split('; ').filter(Boolean),
+      ...newCookies,
+    ];
+    // Dédupliquer par nom
+    const cookieMap = {};
+    allCookies.forEach(c => {
+      const [k,v] = c.split('=');
+      if(k && v !== undefined) cookieMap[k.trim()] = v;
+    });
+    sessionCookies = Object.entries(cookieMap).map(([k,v]) => `${k}=${v}`).join('; ');
+    lastLoginTime = Date.now();
+    addLog('ok', `✔ Session auto — ${Object.keys(cookieMap).length} cookies — status=${r2.status}`);
+    return true;
+  } catch(e) {
+    addLog('err', `Login erreur: ${e.message}`);
+    return false;
+  }
+}
+
+// Vérifie et renouvelle la session si nécessaire
+async function ensureSession() {
+  const age = Date.now() - lastLoginTime;
+  if (!sessionCookies || age > SESSION_TTL) {
+    return await autoLogin();
+  }
+  return true;
+}
+
+// ── RETRAITS ───────────────────────────────────────────────────
 async function getWithdrawals() {
   const res = await fetch('https://my-managment.com/admin/report/pendingrequestwithdrawal', {
     method:'POST', headers:mgmtH(), body:JSON.stringify({page:1,limit:500}),
   });
-  if (!res.ok) throw new Error(`HTTP ${res.status} — renouveler les cookies (/update-cookies)`);
+  if (res.status === 401 || res.status === 403) {
+    addLog('warn', 'Session expirée — reconnexion...');
+    await autoLogin();
+    return getWithdrawals();
+  }
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
+  if (data.is_guest) {
+    addLog('warn', 'is_guest=true — reconnexion...');
+    await autoLogin();
+    return getWithdrawals();
+  }
   const rows = data.data || [];
   const out=[]; let cumul=0;
   const solde = cfg.maxSolde>0 ? cfg.maxSolde : 99999999;
@@ -110,11 +219,14 @@ async function payout(item) {
 async function confirmW(item) {
   if (!item.confirmData) return {ok:false, err:'Pas de confirmData'};
   const cd = item.confirmData;
+
+  // Pre-call obligatoire
   await fetch('https://my-managment.com/admin/banktransfer/getallbanksbysubagentid', {
     method:'POST', headers:mgmtH(),
     body:JSON.stringify({id: cd.subagent_id, ref_id: cd.ref_id||1}),
   }).catch(()=>{});
   await new Promise(r=>setTimeout(r,400));
+
   const fd = new FormData();
   fd.append('code'        , cd.code||'epay');
   fd.append('id'          , String(cd.id));
@@ -126,27 +238,43 @@ async function confirmW(item) {
   fd.append('ref_id'      , String(cd.ref_id||1));
   fd.append('bank_id'     , cd.bank_id ? String(cd.bank_id) : 'null');
   fd.append('report_id'   , '');
+
   const h = {
     'Accept'          : 'application/json, text/plain, */*',
     'X-Requested-With': 'XMLHttpRequest',
     'X-Time-Zone'     : 'GMT+00',
-    'Cookie'          : parseCookies(cfg.mgmtCookies),
+    'Cookie'          : getActiveCookies(),
     'User-Agent'      : 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
     'Referer'         : 'https://my-managment.com/fr/admin/report/pendingrequestwithdrawal',
     ...fd.getHeaders(),
   };
+
   const res = await fetch('https://my-managment.com/admin/banktransfer/approvemoney', {
     method:'POST', headers:h, body:fd,
   });
+
   if (res.status===200||res.status===302) {
     const text = await res.text();
     if (text.startsWith('<')||text.includes('<!DOCTYPE')) return {ok:true};
     try {
       const json = JSON.parse(text);
-      return {ok:json.success===true, err:json.message||''};
+      if (json.success===true) return {ok:true};
+      // Session expirée dans confirmW
+      if (json.is_guest===true) {
+        addLog('warn','Session expirée en confirmation — reconnexion...');
+        await autoLogin();
+        return confirmW(item); // retry
+      }
+      return {ok:false, err:json.message||JSON.stringify(json).substring(0,60)};
     } catch(e) { return {ok:true}; }
   }
   const errText = await res.text().catch(()=>'');
+  // Si 404 avec is_guest — session expirée
+  if (errText.includes('"is_guest":true')) {
+    addLog('warn','Session expirée (is_guest) — reconnexion...');
+    await autoLogin();
+    return confirmW(item);
+  }
   return {ok:false, err:`HTTP ${res.status} — ${errText.substring(0,60)}`};
 }
 
@@ -157,8 +285,8 @@ async function runCycle() {
   isRunning=true; stats.polls++;
   addLog('info',`━━ Poll #${stats.polls} ━━`);
   try {
-    if (!cfg.mgmtCookies) throw new Error('Cookies manquants — cliquer le bookmarklet sur my-managment');
-    if (!cfg.yapsonToken)  throw new Error('Token manquant');
+    await ensureSession();
+    if (!cfg.yapsonToken) throw new Error('YAPSON_TOKEN manquant');
     const items = await getWithdrawals();
     if (!items.length) {
       addLog('info',`Poll F2: 0 confirmé(s), 0 rejeté(s)`);
@@ -197,7 +325,6 @@ function stopPolling(){
   botActive=false; addLog('warn','Bot arrêté');
 }
 
-// ── Route principale (dashboard) ──────────────────────────────
 app.get('/',(req,res)=>{
   const logHtml=logs.slice(0,100).map(e=>{
     const cls=e.type==='ok'?'ok':e.type==='err'?'er':e.type==='warn'?'wa':e.type==='dot'?'dt':'in';
@@ -205,30 +332,8 @@ app.get('/',(req,res)=>{
     return `<div class="le ${cls}"><span class="lt">${e.ts}</span><span>${ic} ${e.msg}</span></div>`;
   }).join('');
   const netOpts=Object.keys(NET_UUIDS).map(n=>`<option value="${n}" ${n===cfg.network?'selected':''}>${n}</option>`).join('');
-  const cookieOk=parseCookies(cfg.mgmtCookies).length>10;
-  const cookieAge = lastCookieUpdate ? Math.round((Date.now()-lastCookieUpdate)/60000)+'min' : 'inconnue';
-  const BOT_URL = 'https://yapson-bot7-production.up.railway.app';
-  const bookmarklet = `javascript:(function(){
-    var c=document.cookie;
-    var all=[];
-    ['auid','lng','PHPSESSID'].forEach(function(n){
-      var m=document.cookie.match(new RegExp('(?:^|;\\s*)'+n+'=([^;]*)'));
-    });
-    fetch('/admin/report/pendingrequestwithdrawal',{method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'XMLHttpRequest'},body:'{"page":1,"limit":1}',credentials:'include'})
-    .then(function(){
-      var xhr=new XMLHttpRequest();
-      xhr.open('GET','/api/session-info',true);
-      xhr.withCredentials=true;
-      xhr.onload=function(){
-        var cookies=xhr.getResponseHeader('X-Session-Cookies')||'';
-        fetch('${BOT_URL}/update-cookies',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookies:cookies})})
-        .then(function(r){return r.json();})
-        .then(function(d){alert(d.ok?'✅ Bot mis à jour!':'❌ '+d.err);})
-        .catch(function(e){alert('Erreur: '+e.message);});
-      };
-      xhr.send();
-    });
-  })()`.replace(/\s+/g,' ');
+  const hasLogin = !!(cfg.mgmtLogin && cfg.mgmtPassword);
+  const sessionAge = lastLoginTime ? Math.round((Date.now()-lastLoginTime)/60000)+'min' : 'jamais';
   res.send(`<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>YapsonBot7</title><meta http-equiv="refresh" content="15">
@@ -253,7 +358,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--b)}
 .btn-go{background:rgba(63,185,80,.2);color:var(--g);border:1px solid rgba(63,185,80,.4)}
 .btn-stop{background:rgba(248,81,73,.15);color:var(--r);border:1px solid rgba(248,81,73,.35)}
 .btn-gray{background:var(--s2);color:var(--m);border:1px solid var(--s3)}
-.btn-orange{background:rgba(240,136,62,.2);color:var(--o);border:1px solid rgba(240,136,62,.4)}
+.btn-blue{background:rgba(88,166,255,.2);color:var(--b);border:1px solid rgba(88,166,255,.4)}
 .btn:hover{filter:brightness(1.15)}.btns{display:flex;gap:8px;flex-wrap:wrap}
 .badge{display:inline-flex;align-items:center;gap:5px;border-radius:20px;padding:4px 12px;font-size:10px;font-weight:700}
 .badge .dot{width:7px;height:7px;border-radius:50%}
@@ -261,20 +366,19 @@ input:focus,select:focus,textarea:focus{border-color:var(--b)}
 .b-on .dot{background:var(--g);animation:pulse 1.8s infinite}
 .b-off{background:rgba(139,148,158,.1);color:var(--m);border:1px solid rgba(139,148,158,.2)}
 .b-off .dot{background:var(--m)}
+.b-info{background:rgba(88,166,255,.1);color:var(--b);border:1px solid rgba(88,166,255,.2)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 .log{background:#0d1117;border-radius:7px;max-height:400px;overflow-y:auto;padding:8px;font-size:10px;line-height:2;word-break:break-word}
 .le{display:flex;gap:10px}.lt{color:var(--m);min-width:135px;flex-shrink:0}
 .ok span:last-child{color:var(--g)}.er span:last-child{color:var(--r)}.wa span:last-child{color:var(--o)}.dt span:last-child{color:var(--m)}.in span:last-child{color:var(--b)}
 .hint{border-radius:7px;padding:8px 12px;font-size:10px;line-height:1.8;margin-top:8px}
-.hint-w{background:rgba(240,136,62,.08);border:1px solid rgba(240,136,62,.2);color:var(--o)}
 .hint-g{background:rgba(63,185,80,.08);border:1px solid rgba(63,185,80,.2);color:var(--g)}
-.hint b{color:var(--t)}.seclbl{font-size:11px;font-weight:700;margin-bottom:10px}
+.hint-w{background:rgba(240,136,62,.08);border:1px solid rgba(240,136,62,.2);color:var(--o)}
+.hint b{color:var(--t)}
+.seclbl{font-size:11px;font-weight:700;margin-bottom:10px}
 .tag-ok{display:inline-block;background:rgba(63,185,80,.15);color:var(--g);border:1px solid rgba(63,185,80,.3);border-radius:4px;padding:1px 7px;font-size:9px;margin-left:6px}
 .tag-err{display:inline-block;background:rgba(248,81,73,.15);color:var(--r);border:1px solid rgba(248,81,73,.3);border-radius:4px;padding:1px 7px;font-size:9px;margin-left:6px}
-.bm-box{background:var(--s2);border:2px dashed var(--o);border-radius:8px;padding:12px 16px;margin-top:12px;cursor:grab;text-align:center;font-size:11px;color:var(--o);font-weight:700;text-decoration:none;display:block}
-.bm-box:hover{background:rgba(240,136,62,.1)}
 </style></head><body><div class="wrap">
-
 <div class="statbar">
 <div class="sc vc"><div class="sv">${stats.confirmed}</div><div class="sl">Confirmés</div></div>
 <div class="sc vm"><div class="sv">${stats.missing}</div><div class="sl">Manquants</div></div>
@@ -284,34 +388,26 @@ input:focus,select:focus,textarea:focus{border-color:var(--b)}
 <div class="sc vr"><div class="sv">${stats.rejected}</div><div class="sl">Rejetés</div></div>
 </div>
 
-<div class="card"><div class="ch"><span>🔑</span> RENOUVELER LES COOKIES</div><div class="cb">
-<div style="color:var(--t);font-size:11px;margin-bottom:12px">
-Glisse ce bouton dans ta barre de favoris, puis clique-le <b>depuis my-managment.com</b> pour envoyer tes cookies frais au bot automatiquement.
-</div>
-<a class="bm-box" href="javascript:(function(){var BOT='https://yapson-bot7-production.up.railway.app';var app=document.querySelector('#app').__vue_app__;var axios=app.config.globalProperties.$http;axios.post('/admin/report/pendingrequestwithdrawal',{page:1,limit:1}).then(function(){var cfg=app.config.globalProperties.$store?app.config.globalProperties.$store.state:{};axios.get('/admin/auth/userinfo').then(function(r){}).catch(function(){});var cookies=document.cookie;fetch(BOT+'/update-cookies',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookies:null,useSession:true,phpsessid:null})}).then(function(r){return r.json();}).then(function(d){alert(d.ok?'✅ Cookies envoyés au bot!':'❌ '+d.err);}).catch(function(e){alert('Erreur CORS: '+e.message);});});})();">
-🔄 YapsonBot — Sync Cookies
-</a>
-<div class="hint hint-w" style="margin-top:10px">
-⚠ La méthode bookmarklet ne peut pas envoyer les cookies HttpOnly (PHPSESSID/auid) à cause de la sécurité navigateur.<br>
-<b>Solution rapide :</b> Colle le JSON ci-dessous dans la section COMPTES :
-</div>
-</div></div>
-
 <div class="card"><div class="ch"><span>🔑</span> COMPTES</div><div class="cb">
 <form method="POST" action="/save-accounts"><div class="g2">
-<div><div class="seclbl" style="color:var(--b)">agg.yapson.net</div>
+<div>
+<div class="seclbl" style="color:var(--b)">agg.yapson.net</div>
 <div class="frow"><label>Token yapson</label>
 <input type="password" name="yapsonToken" value="${cfg.yapsonToken?'●'.repeat(20):''}" placeholder="eyJhbGci...">
 ${cfg.yapsonToken?'<span class="tag-ok">✓ OK</span>':'<span class="tag-err">✗ manquant</span>'}
 </div></div>
-<div><div class="seclbl" style="color:var(--g)">my-managment.com</div>
-<div class="frow"><label>Cookies — <span style="color:var(--o)">âge: ${cookieAge}</span></label>
-<textarea name="mgmtCookies" rows="4" placeholder='JSON Firefox ou PHPSESSID=...; auid=...'>${cfg.mgmtCookies?'(configuré — coller pour remplacer)':''}</textarea>
-${cookieOk?'<span class="tag-ok">✓ OK</span>':'<span class="tag-err">✗ manquant</span>'}
+<div>
+<div class="seclbl" style="color:var(--g)">my-managment.com ${hasLogin?'<span class="tag-ok">✓ Auto-login actif</span>':'<span class="tag-err">✗ Manuel</span>'}</div>
+<div class="frow"><label>Identifiant (login)</label>
+<input type="text" name="mgmtLogin" value="${cfg.mgmtLogin||''}" placeholder="27581639855"></div>
+<div class="frow"><label>Mot de passe</label>
+<input type="password" name="mgmtPassword" value="${cfg.mgmtPassword?'●'.repeat(12):''}" placeholder="••••••••"></div>
+${hasLogin?'<div class="hint hint-g">✔ Session auto — renouvelée il y a <b>'+sessionAge+'</b></div>':'<div class="hint hint-w">Sans login/password, les cookies expirent toutes les ~12h</div>'}
 </div>
-<div class="hint hint-w">Coller le JSON Firefox export ou <b>nom=val; nom2=val2</b></div>
 </div>
-</div><div style="margin-top:14px"><button class="btn btn-save" type="submit">💾 Sauvegarder</button></div>
+<div style="margin-top:14px;display:flex;gap:8px">
+<button class="btn btn-save" type="submit">💾 Sauvegarder</button>
+</div>
 </form></div></div>
 
 <div class="card"><div class="ch"><span>⚙️</span> CONFIGURATION</div><div class="cb">
@@ -330,36 +426,24 @@ ${cookieOk?'<span class="tag-ok">✓ OK</span>':'<span class="tag-err">✗ manqu
 <a class="btn ${botActive?'btn-gray':'btn-go'}" href="/start">▶ Démarrer</a>
 <a class="btn ${botActive?'btn-stop':'btn-gray'}" href="/stop">■ Arrêter</a>
 <a class="btn btn-gray" href="/run">↻ Lancer cycle</a>
+<a class="btn btn-blue" href="/login">🔄 Re-login</a>
 <a class="btn btn-gray" href="/reset">◌ Reset stats</a>
 <a class="btn btn-gray" href="/">⟳ Actualiser</a>
 </div></div></div>
 
 <div class="card"><div class="ch"><span>📋</span> JOURNAL — ${logs.length} entrées</div>
 <div class="cb" style="padding:8px"><div class="log">${logHtml||'<div class="le in"><span class="lt">—</span><span>▸ En attente</span></div>'}</div>
-</div></div>
-</div></body></html>`);
-});
-
-// ── Route update-cookies (appelée par bookmarklet ou manuellement) ──
-app.post('/update-cookies', (req, res) => {
-  const { cookies } = req.body;
-  if (!cookies || typeof cookies !== 'string' || cookies.length < 10) {
-    return res.json({ ok: false, err: 'Cookies invalides ou vides' });
-  }
-  cfg.mgmtCookies = cookies.trim();
-  lastCookieUpdate = Date.now();
-  addLog('ok', `Cookies mis à jour via API — ${parseCookies(cookies).split(';').length} cookie(s)`);
-  if (botActive) { stopPolling(); setTimeout(startPolling, 300); }
-  res.json({ ok: true, msg: 'Cookies mis à jour, bot redémarré' });
+</div></div></div></body></html>`);
 });
 
 app.post('/save-accounts',(req,res)=>{
-  const{yapsonToken,mgmtCookies}=req.body;
+  const{yapsonToken,mgmtLogin,mgmtPassword}=req.body;
   if(yapsonToken&&!yapsonToken.startsWith('●'))cfg.yapsonToken=yapsonToken.trim();
-  if(mgmtCookies&&!mgmtCookies.includes('configuré'))cfg.mgmtCookies=mgmtCookies.trim();
-  lastCookieUpdate = Date.now();
-  addLog('ok',`Comptes mis à jour — ${parseCookies(cfg.mgmtCookies).split(';').length} cookie(s)`);
-  if(botActive){stopPolling();setTimeout(startPolling,500);}
+  if(mgmtLogin)cfg.mgmtLogin=mgmtLogin.trim();
+  if(mgmtPassword&&!mgmtPassword.startsWith('●'))cfg.mgmtPassword=mgmtPassword.trim();
+  addLog('ok','Comptes mis à jour');
+  sessionCookies=''; lastLoginTime=0; // forcer re-login
+  if(botActive){stopPolling();setTimeout(startPolling,1000);}
   res.redirect('/');
 });
 app.post('/save-config',(req,res)=>{
@@ -371,19 +455,25 @@ app.post('/save-config',(req,res)=>{
   if(botActive){stopPolling();setTimeout(startPolling,500);}
   res.redirect('/');
 });
-app.get('/start',(req,res)=>{startPolling();res.redirect('/');});
-app.get('/stop', (req,res)=>{stopPolling(); res.redirect('/');});
-app.get('/run',  async(req,res)=>{runCycle().catch(e=>addLog('err',e.message));res.redirect('/');});
-app.get('/reset',(req,res)=>{Object.keys(stats).forEach(k=>stats[k]=0);logs.length=0;addLog('info','Reset');res.redirect('/');});
-app.get('/health',(req,res)=>res.json({...stats,botActive,network:cfg.network,interval:cfg.pollInterval,cookieAge:lastCookieUpdate?Math.round((Date.now()-lastCookieUpdate)/60000):null}));
+app.get('/start', (req,res)=>{startPolling();res.redirect('/');});
+app.get('/stop',  (req,res)=>{stopPolling(); res.redirect('/');});
+app.get('/run',   async(req,res)=>{runCycle().catch(e=>addLog('err',e.message));res.redirect('/');});
+app.get('/login', async(req,res)=>{await autoLogin();res.redirect('/');});
+app.get('/reset', (req,res)=>{Object.keys(stats).forEach(k=>stats[k]=0);logs.length=0;addLog('info','Reset');res.redirect('/');});
+app.get('/health',(req,res)=>res.json({...stats,botActive,network:cfg.network,interval:cfg.pollInterval,sessionAge:lastLoginTime?Math.round((Date.now()-lastLoginTime)/60000):null}));
 app.get('/cookies',(req,res)=>res.redirect('/'));
 
-app.listen(PORT,()=>{
+app.listen(PORT,async()=>{
   addLog('info',`YapsonBot7 démarré — port ${PORT}`);
   addLog('info',`Réseau: ${cfg.network} | Intervalle: ${cfg.pollInterval}s`);
-  const p=parseCookies(cfg.mgmtCookies);
-  addLog('info',`Cookies: ${p?p.split(';').length+' ok':'MANQUANT'} | Token: ${cfg.yapsonToken?'OK':'MANQUANT'}`);
-  lastCookieUpdate = Date.now();
-  if(cfg.mgmtCookies&&cfg.yapsonToken)startPolling();
-  else addLog('warn','Remplir les comptes dans le dashboard');
+  if(cfg.mgmtLogin&&cfg.mgmtPassword) {
+    addLog('info',`Auto-login activé: ${cfg.mgmtLogin}`);
+    await autoLogin();
+    if(cfg.yapsonToken)startPolling();
+  } else if(cfg.mgmtCookies&&cfg.yapsonToken){
+    addLog('warn','Mode cookies manuels (pas de login/password configuré)');
+    startPolling();
+  } else {
+    addLog('warn','Configurer login+password dans le dashboard');
+  }
 });
