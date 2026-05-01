@@ -10,7 +10,6 @@ const PORT = process.env.PORT || 8080;
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ── Mapping réseau → UUID ─────────────────────────────────────
 const NET_UUIDS = {
   'MOOV CI'  : '24462fd9-c8e2-42f2-a95f-119844bc2ada',
   'MTN CI'   : '77e8e729-a0f1-4e1b-8614-168c77f4b101',
@@ -19,7 +18,6 @@ const NET_UUIDS = {
   'Wave'     : '97847ae3-6c50-4116-a6da-a69695afbaaa',
 };
 
-// ── Config mutable ─────────────────────────────────────────────
 let cfg = {
   mgmtCookies  : process.env.MGMT_COOKIES   || '',
   yapsonToken  : process.env.YAPSON_TOKEN   || '',
@@ -28,7 +26,6 @@ let cfg = {
   maxSolde     : parseInt(process.env.MAX_SOLDE || '0'),
 };
 
-// ── Stats & logs ───────────────────────────────────────────────
 const stats = { confirmed: 0, missing: 0, fixed: 0, polls: 0, rejected: 0 };
 const logs  = [];
 let pollTimer = null;
@@ -42,11 +39,26 @@ function addLog(type, msg) {
   console.log(`[${type.toUpperCase()}] ${ts} — ${msg}`);
 }
 
+// ── Parser cookies: accepte JSON array OU string nom=val; ──────
+function parseCookies(raw) {
+  if (!raw) return '';
+  const s = raw.trim();
+  if (s.startsWith('[')) {
+    try {
+      const arr = JSON.parse(s);
+      if (Array.isArray(arr)) {
+        return arr.map(c => c.name + '=' + c.value).join('; ');
+      }
+    } catch(e) {}
+  }
+  return s;
+}
+
 function mgmtH() {
   return {
     'Content-Type'     : 'application/json',
     'X-Requested-With' : 'XMLHttpRequest',
-    'Cookie'           : cfg.mgmtCookies,
+    'Cookie'           : parseCookies(cfg.mgmtCookies),
     'User-Agent'       : 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
     'Referer'          : 'https://my-managment.com/fr/admin/report/pendingrequestwithdrawal',
   };
@@ -119,8 +131,8 @@ async function runCycle() {
   isRunning = true; stats.polls++;
   addLog('info', `━━ Poll #${stats.polls} ━━`);
   try {
-    if (!cfg.mgmtCookies) throw new Error('MGMT_COOKIES manquant');
-    if (!cfg.yapsonToken)  throw new Error('YAPSON_TOKEN manquant');
+    if (!cfg.mgmtCookies) throw new Error('MGMT_COOKIES manquant — sauvegarder dans Comptes');
+    if (!cfg.yapsonToken)  throw new Error('YAPSON_TOKEN manquant — sauvegarder dans Comptes');
     const items = await getWithdrawals();
     if (!items.length) {
       addLog('info', `Poll F2: 0 confirmé(s), 0 rejeté(s)`);
@@ -138,12 +150,12 @@ async function runCycle() {
       for (const item of paid) {
         const r = await confirmW(item);
         if (r.ok) { stats.confirmed++; addLog('ok',`✔ Confirmé: ${item.phone}`); }
-        else       { stats.missing++;  addLog('warn',`⚠ Manuel: ${item.phone}`); }
+        else       { stats.missing++;  addLog('warn',`⚠ Manuel requis: ${item.phone}`); }
         await sleep(700);
       }
     }
     addLog('info', `Poll F2: ${ok} confirmé(s), ${ko} rejeté(s)`);
-    items.forEach(i=>addLog('dot',`${i.phone} — ${(new Date()).toLocaleTimeString('fr-FR')}`));
+    items.forEach(i=>addLog('dot',`${i.phone} — ${i.montant.toLocaleString()} FCFA`));
   } catch(e) {
     addLog('err',`Erreur: ${e.message}`); stats.rejected++;
   } finally { isRunning=false; }
@@ -165,9 +177,11 @@ app.get('/', (req,res)=>{
   const logHtml = logs.slice(0,100).map(e=>{
     const cls=e.type==='ok'?'ok':e.type==='err'?'er':e.type==='warn'?'wa':e.type==='dot'?'dt':'in';
     const ic =e.type==='ok'?'✔':e.type==='err'?'✘':e.type==='warn'?'⚠':e.type==='dot'?'◉':'▸';
-    return `<div class="le ${cls}"><span class="lt">${e.ts.substring(0,19)}</span><span>${ic} ${e.msg}</span></div>`;
+    return `<div class="le ${cls}"><span class="lt">${e.ts}</span><span>${ic} ${e.msg}</span></div>`;
   }).join('');
   const netOpts = Object.keys(NET_UUIDS).map(n=>`<option value="${n}" ${n===cfg.network?'selected':''}>${n}</option>`).join('');
+  const cookieParsed = parseCookies(cfg.mgmtCookies);
+  const cookieOk = cookieParsed.length > 10;
   res.send(`<!DOCTYPE html>
 <html lang="fr"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -194,7 +208,7 @@ label{font-size:9px;font-weight:700;letter-spacing:1.5px;color:var(--m);text-tra
 input,select,textarea{width:100%;background:var(--s2);border:1px solid var(--s3);color:var(--t);border-radius:6px;padding:8px 10px;font-family:inherit;font-size:12px;outline:none}
 input:focus,select:focus,textarea:focus{border-color:var(--b)}
 .inline{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.inline input{width:80px}.il{font-size:11px;color:var(--m)}
+.il{font-size:11px;color:var(--m)}
 .btn{padding:9px 18px;border-radius:7px;font-family:inherit;font-size:11px;font-weight:700;cursor:pointer;border:none;text-decoration:none;display:inline-block}
 .btn-save{background:rgba(88,166,255,.15);color:var(--b);border:1px solid rgba(88,166,255,.4)}
 .btn-go{background:rgba(63,185,80,.2);color:var(--g);border:1px solid rgba(63,185,80,.4)}
@@ -209,14 +223,18 @@ input:focus,select:focus,textarea:focus{border-color:var(--b)}
 .b-off{background:rgba(139,148,158,.1);color:var(--m);border:1px solid rgba(139,148,158,.2)}
 .b-off .dot{background:var(--m)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-.log{background:#0d1117;border-radius:7px;max-height:360px;overflow-y:auto;padding:8px;font-size:10px;line-height:2}
-.le{display:flex;gap:10px}.lt{color:var(--m);min-width:130px;flex-shrink:0}
+.log{background:#0d1117;border-radius:7px;max-height:400px;overflow-y:auto;padding:8px;font-size:10px;line-height:2;word-break:break-all}
+.le{display:flex;gap:10px}.lt{color:var(--m);min-width:135px;flex-shrink:0}
 .ok span:last-child{color:var(--g)}.er span:last-child{color:var(--r)}
 .wa span:last-child{color:var(--o)}.dt span:last-child{color:var(--m)}
 .in span:last-child{color:var(--b)}
-.hint{background:rgba(240,136,62,.08);border:1px solid rgba(240,136,62,.2);border-radius:7px;padding:8px 12px;font-size:10px;color:var(--o);line-height:1.8;margin-top:8px}
+.hint{border-radius:7px;padding:8px 12px;font-size:10px;line-height:1.8;margin-top:8px}
+.hint-ok{background:rgba(63,185,80,.08);border:1px solid rgba(63,185,80,.2);color:var(--g)}
+.hint-w{background:rgba(240,136,62,.08);border:1px solid rgba(240,136,62,.2);color:var(--o)}
 .hint b{color:var(--t)}
 .seclbl{font-size:11px;font-weight:700;margin-bottom:10px}
+.tag-ok{display:inline-block;background:rgba(63,185,80,.15);color:var(--g);border:1px solid rgba(63,185,80,.3);border-radius:4px;padding:1px 7px;font-size:9px;margin-left:6px}
+.tag-err{display:inline-block;background:rgba(248,81,73,.15);color:var(--r);border:1px solid rgba(248,81,73,.3);border-radius:4px;padding:1px 7px;font-size:9px;margin-left:6px}
 </style></head><body><div class="wrap">
 
 <div class="statbar">
@@ -236,14 +254,18 @@ input:focus,select:focus,textarea:focus{border-color:var(--b)}
 <div>
 <div class="seclbl" style="color:var(--b)">agg.yapson.net</div>
 <div class="frow"><label>Token yapson</label>
-<input type="password" name="yapsonToken" value="${cfg.yapsonToken?'●'.repeat(20):''}" placeholder="eyJhbGci..."></div>
-<div class="hint">F12 → Console → <b>copy(localStorage.getItem('accessToken'))</b></div>
+<input type="password" name="yapsonToken" value="${cfg.yapsonToken?'●'.repeat(20):''}" placeholder="eyJhbGci...">
+${cfg.yapsonToken?'<span class="tag-ok">✓ configuré</span>':'<span class="tag-err">✗ manquant</span>'}
+</div>
+<div class="hint hint-w">F12 → Console → <b>copy(localStorage.getItem('accessToken'))</b></div>
 </div>
 <div>
 <div class="seclbl" style="color:var(--g)">my-managment.com</div>
 <div class="frow"><label>Cookies de session</label>
-<textarea name="mgmtCookies" rows="3" placeholder="PHPSESSID=...; auid=...">${cfg.mgmtCookies?'(configuré — coller pour remplacer)':''}</textarea></div>
-<div class="hint">F12 → Application → Cookies → <b>nom=valeur; nom2=valeur2</b></div>
+<textarea name="mgmtCookies" rows="4" placeholder='PHPSESSID=abc; auid=xyz...&#10;ou coller le JSON complet des cookies'>${cfg.mgmtCookies?'(configuré — coller pour remplacer)':''}</textarea>
+${cookieOk?'<span class="tag-ok">✓ configuré</span>':'<span class="tag-err">✗ manquant</span>'}
+</div>
+<div class="hint hint-w">Accepte le JSON Firefox ou le format <b>nom=val; nom2=val2</b></div>
 </div>
 </div>
 <div style="margin-top:14px"><button class="btn btn-save" type="submit">💾 Sauvegarder</button></div>
@@ -296,7 +318,8 @@ app.post('/save-accounts',(req,res)=>{
   const {yapsonToken,mgmtCookies}=req.body;
   if(yapsonToken&&!yapsonToken.startsWith('●'))cfg.yapsonToken=yapsonToken.trim();
   if(mgmtCookies&&!mgmtCookies.includes('configuré'))cfg.mgmtCookies=mgmtCookies.trim();
-  addLog('ok','Comptes mis à jour');
+  const parsed = parseCookies(cfg.mgmtCookies);
+  addLog('ok',`Comptes mis à jour — cookies: ${parsed.split(';').length} cookie(s)`);
   if(botActive){stopPolling();setTimeout(startPolling,500);}
   res.redirect('/');
 });
@@ -305,7 +328,7 @@ app.post('/save-config',(req,res)=>{
   if(network&&NET_UUIDS[network])cfg.network=network;
   if(pollInterval)cfg.pollInterval=Math.max(60,parseInt(pollInterval));
   if(maxSolde!==undefined)cfg.maxSolde=parseInt(maxSolde)||0;
-  addLog('ok',`Config: réseau=${cfg.network} intervalle=${cfg.pollInterval}s`);
+  addLog('ok',`Config: réseau=${cfg.network} intervalle=${cfg.pollInterval}s maxSolde=${cfg.maxSolde}`);
   if(botActive){stopPolling();setTimeout(startPolling,500);}
   res.redirect('/');
 });
@@ -319,7 +342,8 @@ app.get('/cookies',(req,res)=>res.redirect('/'));
 app.listen(PORT,()=>{
   addLog('info',`YapsonBot7 démarré — port ${PORT}`);
   addLog('info',`Réseau: ${cfg.network} | Intervalle: ${cfg.pollInterval}s`);
-  addLog('info',`Cookies: ${cfg.mgmtCookies?'OK':'MANQUANT'} | Token: ${cfg.yapsonToken?'OK':'MANQUANT'}`);
+  const parsedInit = parseCookies(cfg.mgmtCookies);
+  addLog('info',`Cookies: ${parsedInit?parsedInit.split(';').length+' cookie(s)':'MANQUANT'} | Token: ${cfg.yapsonToken?'OK':'MANQUANT'}`);
   if(cfg.mgmtCookies&&cfg.yapsonToken)startPolling();
   else addLog('warn','Remplir les comptes dans le dashboard pour démarrer');
 });
