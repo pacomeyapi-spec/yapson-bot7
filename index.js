@@ -1,5 +1,5 @@
 // ============================================================
-// YAPSON-BOT7 — Automatisation des retraits (Withdrawals)
+// YAPSON-BOT7 — Automatisation des retraits
 // ============================================================
 
 const express  = require('express');
@@ -50,10 +50,13 @@ function parseCookies(raw) {
   return s;
 }
 
+// Headers JSON (lecture retraits)
 function mgmtH() {
   return {
+    'Accept'           : 'application/json, text/plain, */*',
     'Content-Type'     : 'application/json',
     'X-Requested-With' : 'XMLHttpRequest',
+    'X-Time-Zone'      : 'GMT+00',
     'Cookie'           : parseCookies(cfg.mgmtCookies),
     'User-Agent'       : 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
     'Referer'          : 'https://my-managment.com/fr/admin/report/pendingrequestwithdrawal',
@@ -98,13 +101,15 @@ async function payout(item) {
 async function confirmW(item) {
   if (!item.confirmData) return {ok:false, err:'Pas de confirmData'};
   const cd = item.confirmData;
-  // Appel préalable OBLIGATOIRE — initialise la session serveur sinon 404
+
+  // Appel préalable OBLIGATOIRE avec X-Time-Zone
   await fetch('https://my-managment.com/admin/banktransfer/getallbanksbysubagentid', {
     method:'POST', headers:mgmtH(),
     body:JSON.stringify({id: cd.subagent_id, ref_id: cd.ref_id||1}),
   }).catch(()=>{});
   await new Promise(r=>setTimeout(r,400));
-  // FormData multipart — format exact my-managment
+
+  // FormData multipart avec les headers EXACTS qu'axios envoie (X-Time-Zone obligatoire)
   const fd = new FormData();
   fd.append('code'        , cd.code||'epay');
   fd.append('id'          , String(cd.id));
@@ -116,15 +121,21 @@ async function confirmW(item) {
   fd.append('ref_id'      , String(cd.ref_id||1));
   fd.append('bank_id'     , cd.bank_id ? String(cd.bank_id) : 'null');
   fd.append('report_id'   , '');
+
   const h = {
-    'Cookie'    : parseCookies(cfg.mgmtCookies),
-    'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
-    'Referer'   : 'https://my-managment.com/fr/admin/report/pendingrequestwithdrawal',
+    'Accept'          : 'application/json, text/plain, */*',
+    'X-Requested-With': 'XMLHttpRequest',
+    'X-Time-Zone'     : 'GMT+00',
+    'Cookie'          : parseCookies(cfg.mgmtCookies),
+    'User-Agent'      : 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+    'Referer'         : 'https://my-managment.com/fr/admin/report/pendingrequestwithdrawal',
     ...fd.getHeaders(),
   };
+
   const res = await fetch('https://my-managment.com/admin/banktransfer/approvemoney', {
     method:'POST', headers:h, body:fd,
   });
+
   if (res.status===200||res.status===302) {
     const text = await res.text();
     if (text.startsWith('<')||text.includes('<!DOCTYPE')) return {ok:true};
