@@ -4,6 +4,7 @@
 
 const express = require('express');
 const fetch   = require('node-fetch');
+const FormData = require('form-data');
 
 const app  = express();
 const PORT = process.env.PORT || 8080;
@@ -39,16 +40,14 @@ function addLog(type, msg) {
   console.log(`[${type.toUpperCase()}] ${ts} — ${msg}`);
 }
 
-// ── Parser cookies: accepte JSON array OU string nom=val; ──────
+// ── Parser cookies JSON ou string ────────────────────────────
 function parseCookies(raw) {
   if (!raw) return '';
   const s = raw.trim();
   if (s.startsWith('[')) {
     try {
       const arr = JSON.parse(s);
-      if (Array.isArray(arr)) {
-        return arr.map(c => c.name + '=' + c.value).join('; ');
-      }
+      if (Array.isArray(arr)) return arr.map(c => c.name + '=' + c.value).join('; ');
     } catch(e) {}
   }
   return s;
@@ -71,7 +70,7 @@ async function getWithdrawals() {
   const res = await fetch('https://my-managment.com/admin/report/pendingrequestwithdrawal', {
     method: 'POST', headers: mgmtH(), body: JSON.stringify({ page: 1, limit: 500 }),
   });
-  if (!res.ok) throw new Error(`HTTP ${res.status} — cookies expirés ?`);
+  if (!res.ok) throw new Error(`HTTP ${res.status} — cookies expirés ? Aller sur /cookies`);
   const data = await res.json();
   const rows = data.data || [];
   const out  = []; let cumul = 0;
@@ -101,27 +100,43 @@ async function payout(item) {
 
 async function confirmW(item) {
   if (!item.confirmData) return { ok: false, err: 'Pas de confirmData' };
-  const fd = new URLSearchParams();
-  fd.append('code'        , item.confirmData.code||'epay');
-  fd.append('id'          , String(item.confirmData.id));
+  const cd = item.confirmData;
+  // FormData multipart — format exact attendu par my-managment
+  const fd = new FormData();
+  fd.append('code'        , cd.code || 'epay');
+  fd.append('id'          , String(cd.id));
   fd.append('comment'     , '');
   fd.append('commentId'   , 'null');
   fd.append('otherComment', '');
   fd.append('is_out'      , 'true');
-  fd.append('subagent_id' , String(item.confirmData.subagent_id));
-  fd.append('ref_id'      , String(item.confirmData.ref_id||1));
-  fd.append('bank_id'     , 'null');
+  fd.append('subagent_id' , String(cd.subagent_id));
+  fd.append('ref_id'      , String(cd.ref_id || 1));
+  fd.append('bank_id'     , cd.bank_id ? String(cd.bank_id) : 'null');
   fd.append('report_id'   , '');
+  // Construire les headers sans Content-Type (FormData gère la boundary)
+  const h = {
+    'Cookie'    : parseCookies(cfg.mgmtCookies),
+    'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+    'Referer'   : 'https://my-managment.com/fr/admin/report/pendingrequestwithdrawal',
+    ...fd.getHeaders(),  // boundary multipart
+  };
   const res = await fetch('https://my-managment.com/admin/banktransfer/approvemoney', {
-    method:'POST', headers:{...mgmtH(),'Content-Type':'application/x-www-form-urlencoded'}, body:fd.toString(),
+    method: 'POST', headers: h, body: fd,
   });
-  const body = await res.json().catch(()=>({}));
-  if (body.success) return { ok: true };
-  const res2 = await fetch('https://my-managment.com/admin/banktransfer/approvemoney', {
-    method:'POST', headers:mgmtH(), body:JSON.stringify(item.confirmData),
-  });
-  const body2 = await res2.json().catch(()=>({}));
-  return { ok: body2.success===true, err: body2.message||'Erreur' };
+  // Succès = redirect HTML (pas JSON)
+  if (res.status === 200 || res.status === 302) {
+    const text = await res.text();
+    if (text.includes('<!DOCTYPE') || text.includes('<html') || res.status===302) {
+      return { ok: true };
+    }
+    try {
+      const json = JSON.parse(text);
+      return { ok: json.success===true, err: json.message||'' };
+    } catch(e) {
+      return { ok: true }; // HTML = redirect = succès
+    }
+  }
+  return { ok: false, err: `HTTP ${res.status}` };
 }
 
 function sleep(ms) { return new Promise(r=>setTimeout(r,ms)); }
@@ -131,8 +146,8 @@ async function runCycle() {
   isRunning = true; stats.polls++;
   addLog('info', `━━ Poll #${stats.polls} ━━`);
   try {
-    if (!cfg.mgmtCookies) throw new Error('MGMT_COOKIES manquant — sauvegarder dans Comptes');
-    if (!cfg.yapsonToken)  throw new Error('YAPSON_TOKEN manquant — sauvegarder dans Comptes');
+    if (!cfg.mgmtCookies) throw new Error('MGMT_COOKIES manquant — aller sur /cookies');
+    if (!cfg.yapsonToken)  throw new Error('YAPSON_TOKEN manquant — aller sur /cookies');
     const items = await getWithdrawals();
     if (!items.length) {
       addLog('info', `Poll F2: 0 confirmé(s), 0 rejeté(s)`);
@@ -150,7 +165,7 @@ async function runCycle() {
       for (const item of paid) {
         const r = await confirmW(item);
         if (r.ok) { stats.confirmed++; addLog('ok',`✔ Confirmé: ${item.phone}`); }
-        else       { stats.missing++;  addLog('warn',`⚠ Manuel requis: ${item.phone}`); }
+        else       { stats.missing++;  addLog('warn',`⚠ Manuel requis: ${item.phone} — ${r.err}`); }
         await sleep(700);
       }
     }
@@ -180,8 +195,7 @@ app.get('/', (req,res)=>{
     return `<div class="le ${cls}"><span class="lt">${e.ts}</span><span>${ic} ${e.msg}</span></div>`;
   }).join('');
   const netOpts = Object.keys(NET_UUIDS).map(n=>`<option value="${n}" ${n===cfg.network?'selected':''}>${n}</option>`).join('');
-  const cookieParsed = parseCookies(cfg.mgmtCookies);
-  const cookieOk = cookieParsed.length > 10;
+  const cookieOk = parseCookies(cfg.mgmtCookies).length > 10;
   res.send(`<!DOCTYPE html>
 <html lang="fr"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -203,7 +217,6 @@ body{background:var(--bg);font-family:'Courier New',monospace;color:var(--t);fon
 .g2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 @media(max-width:600px){.g2{grid-template-columns:1fr}}
 .frow{display:flex;flex-direction:column;gap:5px;margin-bottom:12px}
-.frow:last-child{margin-bottom:0}
 label{font-size:9px;font-weight:700;letter-spacing:1.5px;color:var(--m);text-transform:uppercase}
 input,select,textarea{width:100%;background:var(--s2);border:1px solid var(--s3);color:var(--t);border-radius:6px;padding:8px 10px;font-family:inherit;font-size:12px;outline:none}
 input:focus,select:focus,textarea:focus{border-color:var(--b)}
@@ -223,13 +236,12 @@ input:focus,select:focus,textarea:focus{border-color:var(--b)}
 .b-off{background:rgba(139,148,158,.1);color:var(--m);border:1px solid rgba(139,148,158,.2)}
 .b-off .dot{background:var(--m)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-.log{background:#0d1117;border-radius:7px;max-height:400px;overflow-y:auto;padding:8px;font-size:10px;line-height:2;word-break:break-all}
+.log{background:#0d1117;border-radius:7px;max-height:400px;overflow-y:auto;padding:8px;font-size:10px;line-height:2;word-break:break-word}
 .le{display:flex;gap:10px}.lt{color:var(--m);min-width:135px;flex-shrink:0}
 .ok span:last-child{color:var(--g)}.er span:last-child{color:var(--r)}
 .wa span:last-child{color:var(--o)}.dt span:last-child{color:var(--m)}
 .in span:last-child{color:var(--b)}
 .hint{border-radius:7px;padding:8px 12px;font-size:10px;line-height:1.8;margin-top:8px}
-.hint-ok{background:rgba(63,185,80,.08);border:1px solid rgba(63,185,80,.2);color:var(--g)}
 .hint-w{background:rgba(240,136,62,.08);border:1px solid rgba(240,136,62,.2);color:var(--o)}
 .hint b{color:var(--t)}
 .seclbl{font-size:11px;font-weight:700;margin-bottom:10px}
@@ -255,17 +267,17 @@ input:focus,select:focus,textarea:focus{border-color:var(--b)}
 <div class="seclbl" style="color:var(--b)">agg.yapson.net</div>
 <div class="frow"><label>Token yapson</label>
 <input type="password" name="yapsonToken" value="${cfg.yapsonToken?'●'.repeat(20):''}" placeholder="eyJhbGci...">
-${cfg.yapsonToken?'<span class="tag-ok">✓ configuré</span>':'<span class="tag-err">✗ manquant</span>'}
+${cfg.yapsonToken?'<span class="tag-ok">✓ OK</span>':'<span class="tag-err">✗ manquant</span>'}
 </div>
 <div class="hint hint-w">F12 → Console → <b>copy(localStorage.getItem('accessToken'))</b></div>
 </div>
 <div>
 <div class="seclbl" style="color:var(--g)">my-managment.com</div>
 <div class="frow"><label>Cookies de session</label>
-<textarea name="mgmtCookies" rows="4" placeholder='PHPSESSID=abc; auid=xyz...&#10;ou coller le JSON complet des cookies'>${cfg.mgmtCookies?'(configuré — coller pour remplacer)':''}</textarea>
-${cookieOk?'<span class="tag-ok">✓ configuré</span>':'<span class="tag-err">✗ manquant</span>'}
+<textarea name="mgmtCookies" rows="3" placeholder="PHPSESSID=...; auid=...&#10;ou coller le JSON Firefox">${cfg.mgmtCookies?'(configuré — coller pour remplacer)':''}</textarea>
+${cookieOk?'<span class="tag-ok">✓ OK</span>':'<span class="tag-err">✗ manquant</span>'}
 </div>
-<div class="hint hint-w">Accepte le JSON Firefox ou le format <b>nom=val; nom2=val2</b></div>
+<div class="hint hint-w">Accepte JSON Firefox ou <b>nom=val; nom2=val2</b></div>
 </div>
 </div>
 <div style="margin-top:14px"><button class="btn btn-save" type="submit">💾 Sauvegarder</button></div>
@@ -318,8 +330,8 @@ app.post('/save-accounts',(req,res)=>{
   const {yapsonToken,mgmtCookies}=req.body;
   if(yapsonToken&&!yapsonToken.startsWith('●'))cfg.yapsonToken=yapsonToken.trim();
   if(mgmtCookies&&!mgmtCookies.includes('configuré'))cfg.mgmtCookies=mgmtCookies.trim();
-  const parsed = parseCookies(cfg.mgmtCookies);
-  addLog('ok',`Comptes mis à jour — cookies: ${parsed.split(';').length} cookie(s)`);
+  const parsed=parseCookies(cfg.mgmtCookies);
+  addLog('ok',`Comptes mis à jour — ${parsed.split(';').length} cookie(s)`);
   if(botActive){stopPolling();setTimeout(startPolling,500);}
   res.redirect('/');
 });
@@ -328,22 +340,22 @@ app.post('/save-config',(req,res)=>{
   if(network&&NET_UUIDS[network])cfg.network=network;
   if(pollInterval)cfg.pollInterval=Math.max(60,parseInt(pollInterval));
   if(maxSolde!==undefined)cfg.maxSolde=parseInt(maxSolde)||0;
-  addLog('ok',`Config: réseau=${cfg.network} intervalle=${cfg.pollInterval}s maxSolde=${cfg.maxSolde}`);
+  addLog('ok',`Config: ${cfg.network} ${cfg.pollInterval}s`);
   if(botActive){stopPolling();setTimeout(startPolling,500);}
   res.redirect('/');
 });
 app.get('/start',(req,res)=>{startPolling();res.redirect('/');});
 app.get('/stop', (req,res)=>{stopPolling(); res.redirect('/');});
 app.get('/run',  async(req,res)=>{runCycle().catch(e=>addLog('err',e.message));res.redirect('/');});
-app.get('/reset',(req,res)=>{Object.keys(stats).forEach(k=>stats[k]=0);logs.length=0;addLog('info','Stats réinitialisées');res.redirect('/');});
+app.get('/reset',(req,res)=>{Object.keys(stats).forEach(k=>stats[k]=0);logs.length=0;addLog('info','Reset');res.redirect('/');});
 app.get('/health',(req,res)=>res.json({...stats,botActive,network:cfg.network,interval:cfg.pollInterval}));
 app.get('/cookies',(req,res)=>res.redirect('/'));
 
 app.listen(PORT,()=>{
   addLog('info',`YapsonBot7 démarré — port ${PORT}`);
   addLog('info',`Réseau: ${cfg.network} | Intervalle: ${cfg.pollInterval}s`);
-  const parsedInit = parseCookies(cfg.mgmtCookies);
-  addLog('info',`Cookies: ${parsedInit?parsedInit.split(';').length+' cookie(s)':'MANQUANT'} | Token: ${cfg.yapsonToken?'OK':'MANQUANT'}`);
+  const p=parseCookies(cfg.mgmtCookies);
+  addLog('info',`Cookies: ${p?p.split(';').length+' ok':'MANQUANT'} | Token: ${cfg.yapsonToken?'OK':'MANQUANT'}`);
   if(cfg.mgmtCookies&&cfg.yapsonToken)startPolling();
-  else addLog('warn','Remplir les comptes dans le dashboard pour démarrer');
+  else addLog('warn','Remplir les comptes dans le dashboard');
 });
